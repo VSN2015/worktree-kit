@@ -261,6 +261,51 @@ Every stack ships both runner variants under `templates/compose/` and
 `templates/host/` — if `wt init` picks the wrong one (say, a compose file
 that isn't your dev stack), copy the other variant over `worktree-kit.yml`.
 
+## Workflow: branch → worktree → server
+
+`wt` has no worktree-creation command on purpose — worktrees are plain
+`git worktree add`, and `wt` picks up context from wherever you run it: it
+resolves the primary checkout via the git common dir and reads
+`worktree-kit.yml` from there, so a fresh worktree needs zero setup.
+
+Checkout an existing branch into a worktree:
+
+```sh
+cd ~/code/myapp                                  # primary checkout (has worktree-kit.yml)
+git worktree add ../myapp-fix-login fix-login    # plain git — wt is not involved yet
+cd ../myapp-fix-login
+wt run bundle exec rspec spec/                   # one-off command against this branch's code
+wt server                                        # own port + auto isolation for this branch
+```
+
+Or create a new branch as a worktree in one step:
+
+```sh
+git worktree add -b phase02 ../myapp-phase02 master
+cd ../myapp-phase02
+wt server        # -> "myapp_phase02 [isolated] -> http://localhost:3xxx"
+```
+
+Tear down when the branch is done:
+
+```sh
+wt down myapp_fix_login                # stop its server
+git worktree remove ../myapp-fix-login
+wt reset myapp_fix_login               # clear the db-bootstrap marker if it used own-db
+```
+
+If the worktree ran at `own_db`, its `wt_<slug>` database is yours to drop —
+`wt` never deletes data.
+
+Two consequences of how slugs work:
+
+- The worktree **directory name becomes the slug** (lowercased,
+  non-alphanumeric → `_`), and the slug drives the port hash and the Redis
+  `{n}` slot — so name worktree dirs distinctly (`../myapp-phase02`, not
+  `../wt2`).
+- The worktree itself carries no config; running `wt` from the primary
+  checkout also works and is always treated as `shared`.
+
 ## Daily use
 
 ```sh
