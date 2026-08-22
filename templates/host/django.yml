@@ -25,6 +25,12 @@ hooks:
 isolation:
   isolated_env:              # exported at --isolated and --own-db
     REDIS_URL: "redis://localhost:6379/{n}"   # own Redis DB; 0 stays the main app's
+    # Per-worktree TEST database — otherwise every worktree's test runner
+    # fights over the same test_<name> DB. settings.py must read it:
+    #   "TEST": {"NAME": os.environ.get("TEST_DATABASE_NAME", "test_myapp")}
+    # Django creates/destroys it itself — no bootstrap needed. Run suites
+    # with: wt run --isolated python manage.py test
+    TEST_DATABASE_NAME: "wt_{slug}_test"
   own_db_env:                # exported only at --own-db
     # settings.py must read it, e.g.
     #   "NAME": os.environ.get("DATABASE_NAME", "myapp")

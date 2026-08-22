@@ -29,6 +29,14 @@ isolation:
   isolated_env:              # exported at --isolated and --own-db
     REDIS_DB: "{n}"          # queues + default redis connection (db 0 stays the main app's)
     REDIS_CACHE_DB: "{n}"    # cache store
+    # Per-worktree TEST database — phpunit.xml pins one shared DB_DATABASE
+    # for every worktree. Make config/database.php prefer this var in tests:
+    #   'database' => env('APP_ENV') === 'testing'
+    #       ? env('TEST_DB_DATABASE', env('DB_DATABASE', 'forge'))
+    #       : env('DB_DATABASE', 'forge'),
+    # Create once (mysql -uroot -e 'CREATE DATABASE wt_<slug>_test'), then
+    # run suites with: wt run --isolated php artisan test
+    TEST_DB_DATABASE: "wt_{slug}_test"
   own_db_env:                # exported only at --own-db
     DB_DATABASE: "wt_{slug}"
   # db_bootstrap: creates/loads the per-worktree DB; runs once per worktree

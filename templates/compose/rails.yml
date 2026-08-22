@@ -54,6 +54,14 @@ hooks:
 isolation:
   isolated_env:                    # exported at --isolated and --own-db
     REDIS_URL: "redis://redis:6379/{n}"   # own Redis DB; db 0 stays the main app's
+    # Per-worktree TEST database — without it, rspec runs in two worktrees
+    # share one test DB and maintain_test_schema! clobbers the schema across
+    # branches. database.yml must read it:
+    #   test:
+    #     database: <%= ENV.fetch('TEST_DATABASE', 'myapp_test') %>
+    # Create once per worktree: wt run --isolated bin/rails db:test:prepare
+    # then run specs with:      wt run --isolated bundle exec rspec ...
+    TEST_DATABASE: "wt_{slug}_test"
   own_db_env:                      # exported only at --own-db
     # database.yml must read it, e.g.
     #   database: <%= ENV.fetch('DEV_DATABASE', 'myapp_development') %>

@@ -25,6 +25,10 @@ hooks:
 isolation:
   isolated_env:              # exported at --isolated and --own-db
     REDIS_URL: "redis://localhost:6379/{n}"   # own Redis DB; 0 stays the main app's
+    # Per-worktree TEST database — point your test setup (jest globalSetup,
+    # vitest setup, dotenv test profile) at this URL and have it create and
+    # migrate the DB. Run suites with: wt run --isolated npm test
+    TEST_DATABASE_URL: "postgres://localhost/wt_{slug}_test"
   own_db_env:                # exported only at --own-db
     DATABASE_URL: "postgres://localhost/wt_{slug}"
   # db_bootstrap: creates/loads the per-worktree DB; runs once per worktree

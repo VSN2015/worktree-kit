@@ -24,6 +24,10 @@ hooks:
 isolation:
   isolated_env:              # exported at --isolated and --own-db
     REDIS_URL: "redis://localhost:6379/{n}"   # own Redis DB; 0 stays the main app's
+    # Per-worktree TEST database — read it in your test helper (falling back
+    # to the shared name) and create/migrate it there. Run suites with:
+    # wt run --isolated go test ./...
+    TEST_DATABASE_URL: "postgres://localhost/wt_{slug}_test"
   own_db_env:                # exported only at --own-db
     DATABASE_URL: "postgres://localhost/wt_{slug}"
   # db_bootstrap: creates/loads the per-worktree DB; runs once per worktree

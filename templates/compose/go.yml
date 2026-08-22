@@ -35,6 +35,10 @@ hooks:
 isolation:
   isolated_env:              # exported at --isolated and --own-db
     REDIS_URL: "redis://redis:6379/{n}"       # host = your compose redis service
+    # Per-worktree TEST database (host = your compose db service) — read it
+    # in your test helper (falling back to the shared name) and
+    # create/migrate it there. Run suites with: wt run --isolated go test ./...
+    TEST_DATABASE_URL: "postgres://db/wt_{slug}_test"
   own_db_env:                # exported only at --own-db
     DATABASE_URL: "postgres://db/wt_{slug}"   # host = your compose db service
   # db_bootstrap: runs once per worktree (marker under .git/wt-state/,

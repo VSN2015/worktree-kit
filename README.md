@@ -19,7 +19,13 @@ auto-assigned ports, and opt-in isolation (own Redis DB number, own database).
 ## Install
 
 ```sh
-git clone <this repo> && cd worktree-kit && ./install.sh
+brew install VSN2015/tap/worktree-kit   # installs yq too
+```
+
+or from source:
+
+```sh
+git clone https://github.com/VSN2015/worktree-kit && cd worktree-kit && ./install.sh
 brew install yq        # the one dependency (plus docker for compose repos)
 ```
 
@@ -88,6 +94,7 @@ hooks:
 isolation:
   isolated_env:               # env exported at --isolated and --own-db
     REDIS_URL: "redis://redis:6379/{n}"
+    TEST_DATABASE: "wt_{slug}_test"
   own_db_env:                 # env exported only at --own-db
     DEV_DATABASE: "wt_{slug}"
   db_check: "bundle exec rails runner \"ActiveRecord::Base.connection.execute('SELECT 1 FROM schema_migrations LIMIT 1')\""
@@ -150,15 +157,19 @@ new deps from the primary checkout.
 
 Three levels, each a superset of the last:
 
-| level      | what wt exports                 | typical meaning              |
-|------------|---------------------------------|------------------------------|
-| `shared`   | nothing                         | primary's DB, Redis, queues  |
-| `isolated` | `isolated_env`                  | own Redis DB number `{n}`    |
-| `own_db`   | `isolated_env` + `own_db_env`   | own database `wt_{slug}` too |
+| level      | what wt exports                 | typical meaning                  |
+|------------|---------------------------------|----------------------------------|
+| `shared`   | nothing                         | primary's DB, Redis, queues      |
+| `isolated` | `isolated_env`                  | own Redis DB `{n}` + own test DB |
+| `own_db`   | `isolated_env` + `own_db_env`   | own dev database `wt_{slug}` too |
 
-- **`isolated_env`** — env for anything cheap to segregate. The usual entry
-  is a Redis DB number via `{n}`, a stable per-worktree hash in 1–15 (db 0 is
-  deliberately left to your main stack).
+- **`isolated_env`** — env for anything cheap to segregate. The usual entries
+  are a Redis DB number via `{n}` (a stable per-worktree hash in 1–15; db 0
+  is deliberately left to your main stack) and a per-worktree **test**
+  database name (`TEST_DATABASE: "wt_{slug}_test"`). The test DB lives here
+  rather than at `own_db` because it needs no data bootstrap — the framework
+  loads it from the schema — and it is what makes concurrent spec runs across
+  worktrees safe.
 - **`own_db_env`** — env that points the app at a per-worktree database,
   usually named with `{slug}`.
 - **`db_bootstrap`** — creates and loads that database. It runs once per
@@ -179,8 +190,11 @@ one-line config change each stack needs.
 How a level is chosen: CLI flag (`--shared` / `--isolated` / `--own-db`)
 beats a `worktree-kit.local.yml` pin, which beats the automatic choice.
 `wt server` auto-chooses at least `isolated` (escalating per
-`migration_paths`); `wt run` defaults to `shared` so spec runs hit the usual
-test database.
+`migration_paths`); `wt run` defaults to `shared` — fine for one-off
+commands, but a *shared* spec run uses the primary's test database, so
+running suites in several worktrees at once will clobber each other (schema
+reloads across branches, committed test data). Run concurrent suites at
+`--isolated`, where each worktree gets its own test DB.
 
 ### Template variables
 
@@ -223,18 +237,27 @@ if it is busy.
    development:
      database: <%= ENV.fetch('DEV_DATABASE', 'myapp_development') %>
    ```
-4. Check the Redis var name: the template exports `REDIS_URL`; if your app
+4. Same for the test section, so concurrent rspec runs across worktrees don't
+   share one test DB (rspec's `maintain_test_schema!` reloads the schema per
+   branch — on a shared DB that clobbers whoever else is mid-run):
+   ```yaml
+   test:
+     database: <%= ENV.fetch('TEST_DATABASE', 'myapp_test') %>
+   ```
+   Create it once per worktree (`wt run --isolated bin/rails db:test:prepare`),
+   then run suites with `wt run --isolated bundle exec rspec ...`.
+5. Check the Redis var name: the template exports `REDIS_URL`; if your app
    configures Redis/Resque/Sidekiq some other way, export whatever it
    actually reads in `isolated_env`.
-5. Keep `SKIP_TEST_DATABASE=1` in `db_bootstrap`: in Rails 6.x a bare
+6. Keep `SKIP_TEST_DATABASE=1` in `db_bootstrap`: in Rails 6.x a bare
    `db:schema:load` in development **also force-reloads the test database**
    — without the guard, bootstrapping a worktree DB can drop tables out of
    the shared test DB. Prefer per-database tasks (`db:schema:load:primary`)
    if you have multiple databases.
-6. Keep the gem-cache volume and the `prepare` self-heal — gems bake into the
+7. Keep the gem-cache volume and the `prepare` self-heal — gems bake into the
    image at `/usr/local/bundle`, and this pair is what lets each branch's
    `Gemfile.lock` work in one-off containers.
-7. Smoke-test: `wt doctor`, then `wt run bin/rails runner 'puts Rails.env'`,
+8. Smoke-test: `wt doctor`, then `wt run bin/rails runner 'puts Rails.env'`,
    then `wt server` and open the printed URL.
 
 Background jobs: a worker only polls the Redis DB it was started against, so
@@ -247,15 +270,26 @@ an isolated worktree needs its own worker started with the same flag —
   `DB_DATABASE` work out of the box. One trap: `php artisan config:cache`
   freezes config and the exported env is silently ignored — don't cache
   config in development. Adjust `db_bootstrap`'s `mysql -uroot ...` line for
-  your engine (postgres: `createdb wt_{slug}`).
+  your engine (postgres: `createdb wt_{slug}`). Tests: `phpunit.xml` pins one
+  shared `DB_DATABASE` for every worktree — make `config/database.php` prefer
+  the exported `TEST_DB_DATABASE` when `APP_ENV=testing` (snippet in the
+  template), create the DB once, and run suites with
+  `wt run --isolated php artisan test`.
 - **Django** — `settings.py` must read the vars:
   `NAME: os.environ.get("DATABASE_NAME", "myapp")`, same idea for the Redis
-  URL used by your cache/queue.
+  URL used by your cache/queue. Tests: point the `TEST` name at the exported
+  var — `"TEST": {"NAME": os.environ.get("TEST_DATABASE_NAME", "test_myapp")}`
+  — and run `wt run --isolated python manage.py test`; Django creates and
+  destroys the DB itself.
 - **Node** — the template exports `DATABASE_URL` / `REDIS_URL` and assumes
   prisma for `db_bootstrap`; swap in your ORM's migrate command and make
-  sure your config reads those URLs rather than hardcoding.
+  sure your config reads those URLs rather than hardcoding. Tests: point
+  your test setup at the exported `TEST_DATABASE_URL` and have it create and
+  migrate the DB, then `wt run --isolated npm test`.
 - **Go** — same idea: read `DATABASE_URL` / `REDIS_URL` from the environment,
-  and point `db_bootstrap` at your migration tool.
+  and point `db_bootstrap` at your migration tool. Tests: read the exported
+  `TEST_DATABASE_URL` in your test helper and
+  `wt run --isolated go test ./...`.
 
 Every stack ships both runner variants under `templates/compose/` and
 `templates/host/` — if `wt init` picks the wrong one (say, a compose file
@@ -274,7 +308,7 @@ Checkout an existing branch into a worktree:
 cd ~/code/myapp                                  # primary checkout (has worktree-kit.yml)
 git worktree add ../myapp-fix-login fix-login    # plain git — wt is not involved yet
 cd ../myapp-fix-login
-wt run bundle exec rspec spec/                   # one-off command against this branch's code
+wt run --isolated bundle exec rspec spec/        # specs on this branch, own test DB
 wt server                                        # own port + auto isolation for this branch
 ```
 
@@ -309,7 +343,8 @@ Two consequences of how slugs work:
 ## Daily use
 
 ```sh
-wt run bundle exec rspec spec/models/foo_spec.rb   # one-off in this worktree
+wt run bundle exec rspec spec/models/foo_spec.rb   # one-off in this worktree (shared test DB)
+wt run --isolated bundle exec rspec spec/          # own test DB — safe to run in many worktrees at once
 wt server            # this worktree's server: auto port + auto isolation
 wt up                # servers for every worktree
 wt ps / wt logs / wt down
@@ -332,8 +367,11 @@ read-only over the container's copy in every compose run. Two things to know:
 
 ## Caveats
 
-- A shared test database stays shared — run one suite at a time, or point
-  test config at a per-worktree name the same way as `own_db_env`.
+- `wt run` defaults to `shared`, where every worktree's suite hits the
+  primary's test database — concurrent runs clobber each other. The templates
+  export a per-worktree test DB name at `--isolated` (`TEST_DATABASE` /
+  `TEST_DB_DATABASE` / `TEST_DATABASE_NAME` / `TEST_DATABASE_URL`); wire your
+  test config to it and run concurrent suites with `wt run --isolated`.
 - Jobs enqueued under `--isolated` need a worker started with the same flag;
   the main stack's worker only sees its own Redis DB.
 - `{n}` has 15 slots, so two worktrees can land on the same Redis DB — both
