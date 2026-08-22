@@ -303,6 +303,8 @@ cmd_init() {
   kit="$(cd "$(dirname "$self")/.." && pwd)"
   t=""
   [ -f "$PRIMARY/Gemfile" ] && t=rails
+  # artisan before package.json: Laravel repos also carry a package.json
+  [ -z "$t" ] && [ -f "$PRIMARY/artisan" ] && t=laravel
   [ -z "$t" ] && [ -f "$PRIMARY/package.json" ] && t=node
   [ -z "$t" ] && [ -f "$PRIMARY/manage.py" ] && t=django
   [ -z "$t" ] && [ -f "$PRIMARY/go.mod" ] && t=go
