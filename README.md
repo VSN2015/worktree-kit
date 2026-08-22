@@ -19,7 +19,8 @@ auto-assigned ports, and opt-in isolation (own Redis DB number, own database).
 ## Install
 
 ```sh
-brew install VSN2015/tap/worktree-kit   # installs yq too
+brew install VSN2015/tap/worktree-kit
+brew install yq   # skip if any yq v4 is already on your PATH (wt doctor checks)
 ```
 
 or from source:
