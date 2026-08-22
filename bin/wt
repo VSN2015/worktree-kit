@@ -9,7 +9,7 @@
 # Dependencies: git, yq (v4). docker compose only for `runner: compose` repos.
 set -eu
 
-WT_VERSION="0.1.0"
+WT_VERSION="0.1.1"
 
 die() { echo "wt: $*" >&2; exit 1; }
 note() { echo "wt: $*" >&2; }
@@ -354,8 +354,14 @@ wt — worktree-aware runner (config: worktree-kit.yml at the primary checkout)
 EOF
 }
 
-ctx_init
+# help/version must work outside a git repo — handle them before ctx_init
 case "${1:-}" in
+  -h|--help|help|'') usage; exit 0 ;;
+  -v|--version) echo "wt $WT_VERSION"; exit 0 ;;
+esac
+
+ctx_init
+case "$1" in
   run) shift; cmd_run "$@" ;;
   server) shift; cmd_server "$@" ;;
   up) shift; cmd_up "$@" ;;
@@ -366,7 +372,5 @@ case "${1:-}" in
   reset) shift; cmd_reset "$@" ;;
   init) shift; cmd_init "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
-  -h|--help|help|'') usage ;;
-  -v|--version) echo "wt $WT_VERSION" ;;
   *) die "unknown command: $1 (wt --help)" ;;
 esac
