@@ -1,0 +1,13 @@
+# worktrees.yml — Node template (host runner: commands run directly on your machine).
+version: 1
+runner: host
+hooks:
+  prepare: "npm ci --prefer-offline 2>/dev/null || npm install"
+  server: "npm run dev -- --port {port}"
+isolation:
+  isolated_env:
+    REDIS_URL: "redis://localhost:6379/{n}"
+  own_db_env:
+    DATABASE_URL: "postgres://localhost/wt_{slug}"
+  db_bootstrap: "createdb wt_{slug} 2>/dev/null; npx prisma db push"
+  migration_paths: [prisma/migrations]

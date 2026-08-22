@@ -1,0 +1,361 @@
+#!/bin/sh
+# wt — run commands and servers for git worktrees, per-worktree isolated.
+#
+# A worktree-aware runner: every git worktree of a repo can run one-off
+# commands and its own app server, with optional per-worktree isolation
+# (own Redis DB number, own database) declared per repo in worktrees.yml.
+# Stack-agnostic: the core only executes commands the config declares.
+#
+# Dependencies: git, yq (v4). docker compose only for `runner: compose` repos.
+set -eu
+
+WT_VERSION="0.1.0"
+
+die() { echo "wt: $*" >&2; exit 1; }
+note() { echo "wt: $*" >&2; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+# ---------- context ----------
+
+slugify() { basename "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_' | sed 's/_*$//'; }
+hashnum() { printf '%s' "$1" | cksum | cut -d' ' -f1; }
+
+ctx_init() {
+  need git; need yq
+  WT_PATH="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
+  GIT_COMMON="$(git rev-parse --path-format=absolute --git-common-dir)"
+  PRIMARY="$(dirname "$GIT_COMMON")"
+  CONFIG="$PRIMARY/worktrees.yml"
+  LOCAL_CONFIG="$PRIMARY/worktrees.local.yml"
+  PROJECT="$(slugify "$PRIMARY")"
+  SLUG="$(slugify "$WT_PATH")"
+  N=$(( $(hashnum "$SLUG") % 15 + 1 ))
+  STATE_DIR="$GIT_COMMON/wt-state"
+  OVERLAY_DIR="$GIT_COMMON/local"
+  mkdir -p "$STATE_DIR/logs"
+}
+
+require_config() {
+  [ -f "$CONFIG" ] || die "no worktrees.yml at $PRIMARY — run 'wt init' in that repo"
+  RUNNER="$(cfg '.runner // "compose"')"
+  SERVICE="$(cfg '.compose.service // "app"')"
+  WORKDIR="$(cfg '.compose.workdir // "/app"')"
+  CONTAINER_PORT="$(cfg '.hooks.container_port // 3000')"
+  PREPARE="$(cfg '.hooks.prepare // ""')"
+  BUILD="$(cfg '.hooks.build // ""')"
+  SERVER_CMD="$(cfg '.hooks.server // ""')"
+  if [ "$RUNNER" = compose ]; then need docker; fi
+}
+
+cfg() { yq -r "$1" "$CONFIG"; }
+localcfg() { if [ -f "$LOCAL_CONFIG" ]; then yq -r "$1" "$LOCAL_CONFIG"; else echo ""; fi; }
+
+expand() {
+  printf '%s' "$1" | sed \
+    -e "s|{slug}|$SLUG|g" -e "s|{n}|$N|g" -e "s|{port}|${PORT:-}|g" \
+    -e "s|{container_port}|$CONTAINER_PORT|g" -e "s|{project}|$PROJECT|g"
+}
+
+worktree_paths() { git worktree list --porcelain | awk '/^worktree /{print $2}'; }
+
+# ---------- ports ----------
+
+port_free() { ! lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
+
+pick_port() {
+  pin="$(localcfg ".servers.\"$SLUG\".port // \"\"")"
+  if [ -n "$pin" ]; then echo "$pin"; return; fi
+  p=$(( 3000 + $(hashnum "$SLUG") % 900 ))
+  while ! port_free "$p"; do p=$((p + 1)); done
+  echo "$p"
+}
+
+# ---------- isolation ----------
+
+# shared: nothing. isolated: isolated_env. own_db: isolated_env + own_db_env.
+detect_isolation() {
+  pin="$(localcfg ".servers.\"$SLUG\".isolation // \"\"" | tr - _)"
+  if [ -n "$pin" ]; then echo "$pin"; return; fi
+  [ "$WT_PATH" = "$PRIMARY" ] && { echo shared; return; }
+  for mp in $(cfg '.isolation.migration_paths[]? // ""'); do
+    [ -d "$WT_PATH/$mp" ] || continue
+    for f in "$WT_PATH/$mp"/*; do
+      [ -e "$f" ] || continue
+      [ -e "$PRIMARY/$mp/$(basename "$f")" ] || { echo own_db; return; }
+    done
+  done
+  echo isolated
+}
+
+iso_env_list() { # prints expanded KEY=VALUE lines for isolation level $1
+  lvl="$1"
+  if [ "$lvl" = isolated ] || [ "$lvl" = own_db ]; then
+    cfg '.isolation.isolated_env // {} | to_entries[] | .key + "=" + .value' | while IFS= read -r kv; do
+      [ -n "$kv" ] && expand "$kv" && echo
+    done
+  fi
+  if [ "$lvl" = own_db ]; then
+    cfg '.isolation.own_db_env // {} | to_entries[] | .key + "=" + .value' | while IFS= read -r kv; do
+      [ -n "$kv" ] && expand "$kv" && echo
+    done
+  fi
+  true
+}
+
+ensure_own_db() {
+  marker="$STATE_DIR/$SLUG.dbready"
+  [ -f "$marker" ] && return 0
+  check="$(cfg '.isolation.db_check // ""')"
+  if [ -n "$check" ] && runner_exec own_db "$(expand "$check")" >/dev/null 2>&1; then
+    touch "$marker"; return 0
+  fi
+  boot="$(cfg '.isolation.db_bootstrap // ""')"
+  [ -n "$boot" ] || die "own-db needs isolation.db_bootstrap in worktrees.yml"
+  note "bootstrapping isolated database for $SLUG ..."
+  runner_exec own_db "$(expand "$boot")"
+  touch "$marker"
+}
+
+# ---------- compose runner ----------
+
+compose_args() { # mounts + volumes + env for isolation level $1
+  a="-v $WT_PATH:$WORKDIR -v $GIT_COMMON:$GIT_COMMON:ro"
+  for d in $(cfg '.mounts.read_only[]? // ""'); do
+    [ -n "$d" ] && [ -e "$PRIMARY/$d" ] && a="$a -v $PRIMARY/$d:$WORKDIR/$d:ro"
+  done
+  if [ -d "$OVERLAY_DIR" ]; then
+    for f in $(cd "$OVERLAY_DIR" && find . -type f | sed 's|^\./||'); do
+      a="$a -v $OVERLAY_DIR/$f:$WORKDIR/$f:ro"
+    done
+  fi
+  for v in $(cfg '.volumes[]? | .name + ":" + .path'); do
+    name="$(expand "${v%%:*}")"
+    docker volume create "$name" >/dev/null
+    a="$a -v $name:${v#*:}"
+  done
+  for kv in $(iso_env_list "$1"); do a="$a -e $kv"; done
+  echo "$a"
+}
+
+runner_exec() { # $1 = isolation level, $2 = shell string to run in the worktree
+  if [ "$RUNNER" = compose ]; then
+    cd "$PRIMARY"
+    docker compose run --rm --no-deps -T $(compose_args "$1") "$SERVICE" \
+      sh -c "${PREPARE:-:}; $2"
+  else
+    envs="$(iso_env_list "$1" | tr '\n' ' ')"
+    ( cd "$WT_PATH" && env $envs sh -c "${PREPARE:-:}; $2" )
+  fi
+}
+
+# ---------- commands ----------
+
+cmd_run() {
+  require_config
+  LEVEL=shared
+  while [ $# -gt 0 ]; do case "$1" in
+    --isolated) LEVEL=isolated; shift ;;
+    --own-db) LEVEL=own_db; shift ;;
+    --shared) LEVEL=shared; shift ;;
+    --) shift; break ;;
+    *) break ;;
+  esac; done
+  [ $# -gt 0 ] || die "usage: wt run [--shared|--isolated|--own-db] <command...>"
+  [ "$LEVEL" = own_db ] && ensure_own_db
+  if [ "$RUNNER" = compose ]; then
+    cd "$PRIMARY"
+    T=""; [ -t 1 ] || T="-T"
+    exec docker compose run --rm --no-deps $T $(compose_args "$LEVEL") "$SERVICE" \
+      sh -c "${PREPARE:-:}; exec \"\$@\"" sh "$@"
+  else
+    envs="$(iso_env_list "$LEVEL" | tr '\n' ' ')"
+    cd "$WT_PATH"
+    [ -n "${PREPARE:-}" ] && sh -c "$PREPARE"
+    exec env $envs "$@"
+  fi
+}
+
+cmd_server() {
+  require_config
+  LEVEL=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --isolated) LEVEL=isolated; shift ;;
+    --own-db) LEVEL=own_db; shift ;;
+    --shared) LEVEL=shared; shift ;;
+    *) break ;;
+  esac; done
+  [ -n "$SERVER_CMD" ] || die "no hooks.server in worktrees.yml"
+  [ -n "$LEVEL" ] || LEVEL="$(detect_isolation)"
+  PORT="${1:-$(pick_port)}"
+  port_free "$PORT" || die "port $PORT is busy"
+  [ "$LEVEL" = own_db ] && ensure_own_db
+  cmd="${PREPARE:+$(expand "$PREPARE") && }${BUILD:+$(expand "$BUILD") && }$(expand "$SERVER_CMD")"
+  if [ "$RUNNER" = compose ]; then
+    name="wt-$PROJECT-$SLUG"
+    old="$(docker ps -aq --filter "name=^/$name$")"
+    if [ -n "$old" ]; then
+      docker ps -q --filter "name=^/$name$" | grep -q . && die "$SLUG already running — wt down $SLUG first"
+      docker rm "$old" >/dev/null
+    fi
+    cd "$PRIMARY"
+    docker compose run -d --rm --no-deps --name "$name" \
+      -l "wt.project=$PROJECT" -l "wt.slug=$SLUG" -l "wt.port=$PORT" -l "wt.isolation=$LEVEL" \
+      -p "$PORT:$CONTAINER_PORT" $(compose_args "$LEVEL") "$SERVICE" sh -c "$cmd" >/dev/null
+    note "$SLUG [$LEVEL] -> http://localhost:$PORT  (logs: wt logs $SLUG)"
+  else
+    pidfile="$STATE_DIR/$SLUG.pid"
+    if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+      die "$SLUG already running — wt down $SLUG first"
+    fi
+    envs="$(iso_env_list "$LEVEL" | tr '\n' ' ')"
+    log="$STATE_DIR/logs/$SLUG.log"
+    ( cd "$WT_PATH" && env $envs nohup sh -c "$cmd" > "$log" 2>&1 & echo $! > "$pidfile" )
+    echo "$PORT" > "$STATE_DIR/$SLUG.port"
+    note "$SLUG [$LEVEL] -> http://localhost:$PORT  (pid $(cat "$pidfile"), logs: wt logs $SLUG)"
+  fi
+}
+
+cmd_up() {
+  for p in $(worktree_paths); do
+    [ "$p" = "$PRIMARY" ] && continue
+    s="$(slugify "$p")"
+    if [ $# -gt 0 ]; then
+      echo " $* " | grep -q " $s " || continue
+    fi
+    ( cd "$p" && "$0" server ) || note "failed to start $s"
+  done
+}
+
+cmd_down() {
+  require_config
+  if [ "$RUNNER" = compose ]; then
+    if [ $# -gt 0 ]; then
+      for s in "$@"; do
+        docker ps -q --filter "label=wt.project=$PROJECT" --filter "label=wt.slug=$s" | xargs -r docker stop >/dev/null
+        note "stopped $s"
+      done
+    else
+      docker ps -q --filter "label=wt.project=$PROJECT" | xargs -r docker stop >/dev/null
+      note "stopped all $PROJECT worktree servers"
+    fi
+  else
+    for f in "$STATE_DIR"/*.pid; do
+      [ -e "$f" ] || continue
+      s="$(basename "$f" .pid)"
+      if [ $# -gt 0 ]; then echo " $* " | grep -q " $s " || continue; fi
+      kill "$(cat "$f")" 2>/dev/null || true
+      rm -f "$f" "$STATE_DIR/$s.port"; note "stopped $s"
+    done
+  fi
+}
+
+cmd_ps() {
+  require_config
+  if [ "$RUNNER" = compose ]; then
+    docker ps --filter "label=wt.project=$PROJECT" \
+      --format 'table {{.Label "wt.slug"}}\t{{.Label "wt.isolation"}}\thttp://localhost:{{.Label "wt.port"}}\t{{.Status}}'
+  else
+    printf 'SLUG\tURL\tPID\tSTATE\n'
+    for f in "$STATE_DIR"/*.pid; do
+      [ -e "$f" ] || continue
+      s="$(basename "$f" .pid)"
+      pid="$(cat "$f")"
+      st=dead; kill -0 "$pid" 2>/dev/null && st=running
+      prt="$(cat "$STATE_DIR/$s.port" 2>/dev/null || echo '?')"
+      printf '%s\thttp://localhost:%s\t%s\t%s\n' "$s" "$prt" "$pid" "$st"
+    done
+  fi
+}
+
+cmd_logs() {
+  require_config
+  s="${1:-$SLUG}"
+  if [ "$RUNNER" = compose ]; then
+    exec docker logs -f "wt-$PROJECT-$s"
+  else
+    exec tail -f "$STATE_DIR/logs/$s.log"
+  fi
+}
+
+cmd_localize() {
+  case "${1:-}" in
+    --list) if [ -d "$OVERLAY_DIR" ]; then cd "$OVERLAY_DIR" && find . -type f | sed 's|^\./||'; fi; return 0 ;;
+    --remove) shift; for p in "$@"; do rm -f "$OVERLAY_DIR/$p" && note "removed overlay: $p"; done; return ;;
+    '') die "usage: wt localize <tracked-file>... | --list | --remove <file>..." ;;
+  esac
+  for p in "$@"; do
+    [ -f "$PRIMARY/$p" ] || die "no such file in primary checkout: $p"
+    mkdir -p "$OVERLAY_DIR/$(dirname "$p")"
+    cp "$PRIMARY/$p" "$OVERLAY_DIR/$p"
+    note "localized: $p"
+  done
+}
+
+cmd_reset() {
+  s="${1:-$SLUG}"
+  rm -f "$STATE_DIR/$s.dbready"
+  note "cleared db-bootstrap marker for $s (next own-db run re-bootstraps)"
+}
+
+cmd_init() {
+  [ -f "$CONFIG" ] && die "worktrees.yml already exists at $PRIMARY"
+  self="$0"; [ -L "$self" ] && self="$(readlink "$self")"
+  kit="$(cd "$(dirname "$self")/.." && pwd)"
+  t=""
+  [ -f "$PRIMARY/Gemfile" ] && t=rails
+  [ -z "$t" ] && [ -f "$PRIMARY/package.json" ] && t=node
+  [ -z "$t" ] && [ -f "$PRIMARY/manage.py" ] && t=django
+  [ -z "$t" ] && [ -f "$PRIMARY/go.mod" ] && t=go
+  [ -n "$t" ] || die "could not detect stack — copy a template from $kit/templates/ yourself"
+  cp "$kit/templates/$t.yml" "$CONFIG"
+  note "wrote $CONFIG from the $t template — edit it, then try 'wt server'"
+}
+
+cmd_doctor() {
+  echo "wt $WT_VERSION"
+  echo "primary:   $PRIMARY"
+  echo "worktree:  $WT_PATH (slug: $SLUG, n: $N)"
+  if [ -f "$CONFIG" ]; then require_config; echo "config:    $CONFIG (runner: $RUNNER)"; else echo "config:    MISSING — run wt init"; fi
+  command -v yq >/dev/null 2>&1 && echo "yq:        $(yq --version)" || echo "yq:        MISSING"
+  [ "${RUNNER:-compose}" = compose ] && { docker info >/dev/null 2>&1 && echo "docker:    up" || echo "docker:    DOWN"; }
+  if [ -d "$OVERLAY_DIR" ]; then
+    for f in $(cd "$OVERLAY_DIR" && find . -type f | sed 's|^\./||'); do
+      [ "$PRIMARY/$f" -nt "$OVERLAY_DIR/$f" ] && echo "STALE overlay: $f (source is newer — wt localize $f)"
+    done
+  fi
+  echo "ok"
+}
+
+usage() {
+  cat <<'EOF'
+wt — worktree-aware runner (config: worktrees.yml at the primary checkout)
+
+  wt run [--shared|--isolated|--own-db] [--] <cmd...>   one-off command in this worktree
+  wt server [--shared|--isolated|--own-db] [port]       start this worktree's server (auto port + isolation)
+  wt up [slug...]        start servers for all (or named) worktrees
+  wt down [slug...]      stop servers
+  wt ps                  list running worktree servers
+  wt logs [slug]         follow a server's logs
+  wt localize <file...>  snapshot a personal overlay (--list / --remove)
+  wt reset [slug]        clear the own-db bootstrap marker
+  wt init                write worktrees.yml from a stack template
+  wt doctor              environment + config checks
+EOF
+}
+
+ctx_init
+case "${1:-}" in
+  run) shift; cmd_run "$@" ;;
+  server) shift; cmd_server "$@" ;;
+  up) shift; cmd_up "$@" ;;
+  down) shift; cmd_down "$@" ;;
+  ps) shift; cmd_ps "$@" ;;
+  logs) shift; cmd_logs "$@" ;;
+  localize) shift; cmd_localize "$@" ;;
+  reset) shift; cmd_reset "$@" ;;
+  init) shift; cmd_init "$@" ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  -h|--help|help|'') usage ;;
+  -v|--version) echo "wt $WT_VERSION" ;;
+  *) die "unknown command: $1 (wt --help)" ;;
+esac

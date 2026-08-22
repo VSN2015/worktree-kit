@@ -1,0 +1,26 @@
+# worktrees.yml — Rails + docker compose template. Edit to match your repo.
+version: 1
+runner: compose
+compose:
+  service: app          # the compose service whose image runs your code
+  workdir: /app         # where compose mounts the checkout
+volumes:
+  - name: "{project}_wt_cache"     # persistent gem cache shared by worktrees
+    path: /usr/local/bundle
+mounts:
+  read_only: [node_modules]        # dep dirs served from the primary checkout
+hooks:
+  prepare: "bundle check >/dev/null 2>&1 || bundle install --jobs=4 --retry=3"
+  build: "yarn build"
+  server: "rm -f tmp/pids/server.pid && bundle exec rails s -b 0.0.0.0 -p {container_port}"
+  container_port: 3000
+isolation:
+  isolated_env:                    # applied for --isolated and --own-db
+    REDIS_URL: "redis://redis:6379/{n}"
+  own_db_env:                      # applied only for --own-db
+    DEV_DATABASE: "wt_{slug}"      # your database.yml must read this env var
+  db_check: "bundle exec rails runner \"ActiveRecord::Base.connection.execute('SELECT 1 FROM schema_migrations LIMIT 1')\""
+  # SKIP_TEST_DATABASE: a bare db:schema:load in development ALSO reloads the
+  # test database (Rails 6.x) — keep the guard.
+  db_bootstrap: "SKIP_TEST_DATABASE=1 bundle exec rails db:create db:schema:load"
+  migration_paths: [db/migrate]
