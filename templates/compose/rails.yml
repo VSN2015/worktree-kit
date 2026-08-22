@@ -1,0 +1,70 @@
+# worktree-kit.yml — Rails template, compose runner: one-off `docker compose
+# run` containers on your already-running stack. Host variant: templates/host/rails.yml.
+#
+# wt only ever runs the commands declared in this file. Every key can be
+# omitted except hooks.server, which `wt server` needs. Template variables —
+# usable in hook commands, env values, and volume names (no value may
+# contain a space):
+#   {slug}            worktree dir name, lowercased
+#   {n}               stable per-worktree number 1-15 (Redis DB slot)
+#   {port}            host port — set for `wt server`, empty in `wt run`
+#   {container_port}  hooks.container_port
+#   {project}         primary checkout dir name, lowercased
+# Note: `prepare` runs unexpanded in `wt run` — keep template vars out of it.
+
+version: 1        # schema marker; reserved, not read today
+runner: compose   # compose = one-off `docker compose run` containers on your
+                  # already-running stack; host = plain processes
+
+compose:          # read only when runner: compose
+  service: app    # docker-compose.yml service whose IMAGE runs your code
+  workdir: /app   # where that image expects the checkout (copy from your
+                  # compose file's volumes:) — wt mounts the worktree there
+
+# Named docker volumes added to every wt container: for state baked into the
+# image that a one-off container would otherwise reset. Gems live in the
+# image at /usr/local/bundle — without this volume every wt container
+# regresses to image gems and ignores your branch's Gemfile.lock; `prepare`
+# keeps it current per branch. Template vars work in name, not in path.
+volumes:
+  - name: "{project}_wt_cache"     # one shared gem cache per repo
+    path: /usr/local/bundle
+
+# Dirs mounted read-only from the PRIMARY checkout: builds that read them
+# work, installs that write them fail loudly. Install deps in the primary.
+mounts:
+  read_only: [node_modules]
+
+hooks:
+  # prepare: runs before EVERY wt run / wt server — an idempotent dependency
+  # self-heal, near-instant when there is nothing to do.
+  prepare: "bundle check >/dev/null 2>&1 || bundle install --jobs=4 --retry=3"
+  # build: runs once, before the server starts only. Omit if you have none.
+  build: "yarn build"
+  # server: the long-running command; must bind 0.0.0.0 and listen on
+  # {container_port}. wt publishes {port}:{container_port} per worktree.
+  server: "rm -f tmp/pids/server.pid && bundle exec rails s -b 0.0.0.0 -p {container_port}"
+  container_port: 3000
+
+# Isolation levels: shared (nothing) < isolated (isolated_env) < own_db
+# (isolated_env + own_db_env, plus a one-time db_bootstrap per worktree).
+# `wt server` auto-picks at least isolated, escalating to own_db when the
+# worktree has files under migration_paths that the primary lacks; `wt run`
+# defaults to shared. wt only EXPORTS these vars — your app must read them.
+isolation:
+  isolated_env:                    # exported at --isolated and --own-db
+    REDIS_URL: "redis://redis:6379/{n}"   # own Redis DB; db 0 stays the main app's
+  own_db_env:                      # exported only at --own-db
+    # database.yml must read it, e.g.
+    #   database: <%= ENV.fetch('DEV_DATABASE', 'myapp_development') %>
+    DEV_DATABASE: "wt_{slug}"
+  # db_check (optional): exit 0 when the worktree DB already exists — wt then
+  # skips db_bootstrap and just marks the worktree ready.
+  db_check: "bundle exec rails runner \"ActiveRecord::Base.connection.execute('SELECT 1 FROM schema_migrations LIMIT 1')\""
+  # db_bootstrap: creates/loads the per-worktree DB; runs once (marker under
+  # .git/wt-state/, cleared by `wt reset`). Keep SKIP_TEST_DATABASE=1 — a
+  # bare db:schema:load in development ALSO reloads the TEST database
+  # (Rails 6.x). Prefer per-database tasks if you have several.
+  db_bootstrap: "SKIP_TEST_DATABASE=1 bundle exec rails db:create db:schema:load"
+  # Dirs compared against the primary to auto-escalate a server to own_db.
+  migration_paths: [db/migrate]

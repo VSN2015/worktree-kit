@@ -3,7 +3,7 @@
 #
 # A worktree-aware runner: every git worktree of a repo can run one-off
 # commands and its own app server, with optional per-worktree isolation
-# (own Redis DB number, own database) declared per repo in worktrees.yml.
+# (own Redis DB number, own database) declared per repo in worktree-kit.yml.
 # Stack-agnostic: the core only executes commands the config declares.
 #
 # Dependencies: git, yq (v4). docker compose only for `runner: compose` repos.
@@ -25,8 +25,8 @@ ctx_init() {
   WT_PATH="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
   GIT_COMMON="$(git rev-parse --path-format=absolute --git-common-dir)"
   PRIMARY="$(dirname "$GIT_COMMON")"
-  CONFIG="$PRIMARY/worktrees.yml"
-  LOCAL_CONFIG="$PRIMARY/worktrees.local.yml"
+  CONFIG="$PRIMARY/worktree-kit.yml"
+  LOCAL_CONFIG="$PRIMARY/worktree-kit.local.yml"
   PROJECT="$(slugify "$PRIMARY")"
   SLUG="$(slugify "$WT_PATH")"
   N=$(( $(hashnum "$SLUG") % 15 + 1 ))
@@ -36,7 +36,7 @@ ctx_init() {
 }
 
 require_config() {
-  [ -f "$CONFIG" ] || die "no worktrees.yml at $PRIMARY — run 'wt init' in that repo"
+  [ -f "$CONFIG" ] || die "no worktree-kit.yml at $PRIMARY — run 'wt init' in that repo"
   RUNNER="$(cfg '.runner // "compose"')"
   SERVICE="$(cfg '.compose.service // "app"')"
   WORKDIR="$(cfg '.compose.workdir // "/app"')"
@@ -110,7 +110,7 @@ ensure_own_db() {
     touch "$marker"; return 0
   fi
   boot="$(cfg '.isolation.db_bootstrap // ""')"
-  [ -n "$boot" ] || die "own-db needs isolation.db_bootstrap in worktrees.yml"
+  [ -n "$boot" ] || die "own-db needs isolation.db_bootstrap in worktree-kit.yml"
   note "bootstrapping isolated database for $SLUG ..."
   runner_exec own_db "$(expand "$boot")"
   touch "$marker"
@@ -184,7 +184,7 @@ cmd_server() {
     --shared) LEVEL=shared; shift ;;
     *) break ;;
   esac; done
-  [ -n "$SERVER_CMD" ] || die "no hooks.server in worktrees.yml"
+  [ -n "$SERVER_CMD" ] || die "no hooks.server in worktree-kit.yml"
   [ -n "$LEVEL" ] || LEVEL="$(detect_isolation)"
   PORT="${1:-$(pick_port)}"
   port_free "$PORT" || die "port $PORT is busy"
@@ -298,7 +298,7 @@ cmd_reset() {
 }
 
 cmd_init() {
-  [ -f "$CONFIG" ] && die "worktrees.yml already exists at $PRIMARY"
+  [ -f "$CONFIG" ] && die "worktree-kit.yml already exists at $PRIMARY"
   self="$0"; [ -L "$self" ] && self="$(readlink "$self")"
   kit="$(cd "$(dirname "$self")/.." && pwd)"
   t=""
@@ -309,8 +309,12 @@ cmd_init() {
   [ -z "$t" ] && [ -f "$PRIMARY/manage.py" ] && t=django
   [ -z "$t" ] && [ -f "$PRIMARY/go.mod" ] && t=go
   [ -n "$t" ] || die "could not detect stack — copy a template from $kit/templates/ yourself"
-  cp "$kit/templates/$t.yml" "$CONFIG"
-  note "wrote $CONFIG from the $t template — edit it, then try 'wt server'"
+  r=host
+  for c in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+    if [ -f "$PRIMARY/$c" ]; then r=compose; break; fi
+  done
+  cp "$kit/templates/$r/$t.yml" "$CONFIG"
+  note "wrote $CONFIG from the $r/$t template — edit it, then try 'wt server'"
 }
 
 cmd_doctor() {
@@ -330,7 +334,7 @@ cmd_doctor() {
 
 usage() {
   cat <<'EOF'
-wt — worktree-aware runner (config: worktrees.yml at the primary checkout)
+wt — worktree-aware runner (config: worktree-kit.yml at the primary checkout)
 
   wt run [--shared|--isolated|--own-db] [--] <cmd...>   one-off command in this worktree
   wt server [--shared|--isolated|--own-db] [port]       start this worktree's server (auto port + isolation)
@@ -340,7 +344,7 @@ wt — worktree-aware runner (config: worktrees.yml at the primary checkout)
   wt logs [slug]         follow a server's logs
   wt localize <file...>  snapshot a personal overlay (--list / --remove)
   wt reset [slug]        clear the own-db bootstrap marker
-  wt init                write worktrees.yml from a stack template
+  wt init                write worktree-kit.yml from a stack template
   wt doctor              environment + config checks
 EOF
 }

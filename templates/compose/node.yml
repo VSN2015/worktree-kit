@@ -1,0 +1,46 @@
+# worktree-kit.yml — Node template, compose runner: one-off `docker compose
+# run` containers on your already-running stack. Host variant: templates/host/node.yml.
+#
+# wt only ever runs the commands declared here; hooks.server is the one key
+# `wt server` requires. Template variables — usable in hook commands, env
+# values, and volume names (no value may contain a space):
+#   {slug} worktree dir name, lowercased    {n} stable per-worktree 1-15
+#   {port} host port (set for `wt server`, empty in `wt run`)
+#   {container_port} hooks.container_port   {project} primary dir name
+
+version: 1        # schema marker; reserved, not read today
+runner: compose   # one-off containers with the worktree mounted over workdir
+
+compose:
+  service: app    # your compose service whose IMAGE runs your code
+  workdir: /app   # where that image expects the checkout
+
+# node_modules served read-only from the PRIMARY checkout: builds work,
+# installs fail loudly — run npm install in the primary. (No prepare hook: a
+# shared install volume would thrash between branches with different
+# lockfiles, so deps live in the primary's node_modules.)
+mounts:
+  read_only: [node_modules]
+
+hooks:
+  # server: must bind 0.0.0.0 and listen on {container_port};
+  # wt publishes {port}:{container_port} per worktree.
+  server: "npm run dev -- --host 0.0.0.0 --port {container_port}"
+  container_port: 3000
+
+# Isolation levels: shared (nothing) < isolated (isolated_env) < own_db
+# (isolated_env + own_db_env, plus a one-time db_bootstrap per worktree).
+# `wt server` auto-picks at least isolated, escalating to own_db when the
+# worktree has files under migration_paths that the primary lacks; `wt run`
+# defaults to shared. wt only EXPORTS these vars — your app must read them.
+isolation:
+  isolated_env:              # exported at --isolated and --own-db
+    REDIS_URL: "redis://redis:6379/{n}"       # host = your compose redis service
+  own_db_env:                # exported only at --own-db
+    DATABASE_URL: "postgres://db/wt_{slug}"   # host = your compose db service
+  # db_bootstrap: runs once per worktree (marker under .git/wt-state/,
+  # cleared by `wt reset`). prisma creates the DB if missing — swap in your
+  # ORM's migrate command.
+  db_bootstrap: "npx prisma db push"
+  # Dirs compared against the primary to auto-escalate a server to own_db.
+  migration_paths: [prisma/migrations]

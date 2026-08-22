@@ -1,0 +1,43 @@
+# worktree-kit.yml — Rails template, host runner: commands run directly on
+# your machine, no docker. Compose variant: templates/compose/rails.yml.
+#
+# wt only ever runs the commands declared here; hooks.server is the one key
+# `wt server` requires. Template variables — usable in hook commands and env
+# values (no value may contain a space):
+#   {slug} worktree dir name, lowercased    {n} stable per-worktree 1-15
+#   {port} host port (set for `wt server`, empty in `wt run`)
+#   {project} primary checkout dir name, lowercased
+
+version: 1     # schema marker; reserved, not read today
+runner: host   # plain processes in the worktree dir with the isolation env exported
+
+hooks:
+  # prepare: runs before EVERY wt run / wt server — idempotent dependency self-heal.
+  prepare: "bundle check >/dev/null 2>&1 || bundle install --jobs=4 --retry=3"
+  # build: runs once, before the server starts only. Omit if you have none.
+  build: "yarn build"
+  # server: the long-running command; on the host runner use {port} directly.
+  server: "rm -f tmp/pids/server.pid && bundle exec rails s -b 0.0.0.0 -p {port}"
+
+# Isolation levels: shared (nothing) < isolated (isolated_env) < own_db
+# (isolated_env + own_db_env, plus a one-time db_bootstrap per worktree).
+# `wt server` auto-picks at least isolated, escalating to own_db when the
+# worktree has files under migration_paths that the primary lacks; `wt run`
+# defaults to shared. wt only EXPORTS these vars — your app must read them.
+isolation:
+  isolated_env:                    # exported at --isolated and --own-db
+    REDIS_URL: "redis://localhost:6379/{n}"   # own Redis DB; db 0 stays the main app's
+  own_db_env:                      # exported only at --own-db
+    # database.yml must read it, e.g.
+    #   database: <%= ENV.fetch('DEV_DATABASE', 'myapp_development') %>
+    DEV_DATABASE: "wt_{slug}"
+  # db_check (optional): exit 0 when the worktree DB already exists — wt then
+  # skips db_bootstrap and just marks the worktree ready.
+  db_check: "bundle exec rails runner \"ActiveRecord::Base.connection.execute('SELECT 1 FROM schema_migrations LIMIT 1')\""
+  # db_bootstrap: creates/loads the per-worktree DB; runs once (marker under
+  # .git/wt-state/, cleared by `wt reset`). Keep SKIP_TEST_DATABASE=1 — a
+  # bare db:schema:load in development ALSO reloads the TEST database
+  # (Rails 6.x). Prefer per-database tasks if you have several.
+  db_bootstrap: "SKIP_TEST_DATABASE=1 bundle exec rails db:create db:schema:load"
+  # Dirs compared against the primary to auto-escalate a server to own_db.
+  migration_paths: [db/migrate]
