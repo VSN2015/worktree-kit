@@ -299,7 +299,12 @@ cmd_reset() {
 
 cmd_init() {
   [ -f "$CONFIG" ] && die "worktree-kit.yml already exists at $PRIMARY"
-  self="$0"; [ -L "$self" ] && self="$(readlink "$self")"
+  # resolve symlink chains; relative targets (Homebrew, npm) resolve against the link's dir
+  self="$0"
+  while [ -L "$self" ]; do
+    link="$(readlink "$self")"
+    case "$link" in /*) self="$link" ;; *) self="$(dirname "$self")/$link" ;; esac
+  done
   kit="$(cd "$(dirname "$self")/.." && pwd)"
   t=""
   [ -f "$PRIMARY/Gemfile" ] && t=rails
