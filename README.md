@@ -1,17 +1,47 @@
+<div align="center">
+
 # worktree-kit
+
+**Run every branch of one repo side by side — each git worktree with its own
+server, port, and database.**
+
+[![test](https://github.com/VSN2015/worktree-kit/actions/workflows/test.yml/badge.svg)](https://github.com/VSN2015/worktree-kit/actions/workflows/test.yml)
+[![npm](https://img.shields.io/npm/v/worktree-kit?logo=npm&color=cb3837)](https://www.npmjs.com/package/worktree-kit)
+[![homebrew](https://img.shields.io/badge/homebrew-VSN2015%2Ftap-fbb040?logo=homebrew&logoColor=white)](https://github.com/VSN2015/homebrew-tap)
+[![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-5b8dbe)](#install)
+[![runtime deps](https://img.shields.io/badge/runtime%20deps-none-2ea44f)](#install)
+[![license](https://img.shields.io/github/license/VSN2015/worktree-kit?color=blue)](LICENSE)
+
+[Install](#install) · [Setup](#per-repo-setup) · [Config](#config-reference) · [Commands](#daily-use) · [Stack guides](#stack-guide-rails-on-docker-compose) · [Caveats](#caveats)
+
+</div>
+
+---
 
 `wt` runs commands and app servers for git worktrees, so many branches of one
 repo can run side by side without collisions. It is stack-agnostic: the core
 executes only commands that each repo declares in a `worktree-kit.yml`.
 
+```sh
+cd ~/code/myapp
+git worktree add -b phase02 ../myapp-phase02 master
+cd ../myapp-phase02
+
+wt server
+# myapp_phase02 [isolated] -> http://localhost:3247
+
+wt run --isolated bundle exec rspec spec/
+# specs on this branch, in its own test database
+```
+
 ## Why
 
 Parallel agent/branch work with git worktrees hits three walls:
 
-1. Docker compose mounts only the primary checkout, so `docker exec` runs the
-   wrong code for a worktree.
-2. Servers fight over ports.
-3. Branches share one database, one Redis, one job queue.
+1. **Docker runs the wrong code** — compose mounts only the primary checkout,
+   so `docker exec` runs the wrong code for a worktree.
+2. **Servers fight over ports** — every branch wants :3000.
+3. **Branches share one everything** — one database, one Redis, one job queue.
 
 `wt` fixes all three: per-worktree containers (or host processes), stable
 auto-assigned ports, and opt-in isolation (own Redis DB number, own database).
@@ -65,7 +95,9 @@ flavors — `templates/compose/<stack>.yml` and `templates/host/<stack>.yml`:
 one.) The template is a starting point: read the reference below, fix the few
 values that don't match your repo, make your app config read the isolation
 env vars (the one manual step — see the stack guides), then run `wt doctor`.
-Commit `worktree-kit.yml`; it holds no secrets.
+
+> [!TIP]
+> Commit `worktree-kit.yml` — it holds no secrets.
 
 The files in `templates/` are references, not the limit — `wt` is
 stack-agnostic and only ever runs the commands your config declares, so any
@@ -196,9 +228,10 @@ Three levels, each a superset of the last:
   migrations), `wt server` auto-escalates that worktree to `own_db`, because
   migrating the shared DB would break every other branch.
 
-**wt only exports env vars — your app config must read them.** Nothing
-happens for a var your framework ignores; see the stack guides below for the
-one-line config change each stack needs.
+> [!IMPORTANT]
+> **wt only exports env vars — your app config must read them.** Nothing
+> happens for a var your framework ignores; see the stack guides below for
+> the one-line config change each stack needs.
 
 How a level is chosen: CLI flag (`--shared` / `--isolated` / `--own-db`)
 beats a `worktree-kit.local.yml` pin, which beats the automatic choice.
@@ -544,11 +577,13 @@ read-only over the container's copy in every compose run. Two things to know:
 
 ## Caveats
 
-- `wt run` defaults to `shared`, where every worktree's suite hits the
-  primary's test database — concurrent runs clobber each other. The templates
-  export a per-worktree test DB name at `--isolated` (`TEST_DATABASE` /
-  `TEST_DB_DATABASE` / `TEST_DATABASE_NAME` / `TEST_DATABASE_URL`); wire your
-  test config to it and run concurrent suites with `wt run --isolated`.
+> [!WARNING]
+> `wt run` defaults to `shared`, where every worktree's suite hits the
+> primary's test database — concurrent runs clobber each other. The templates
+> export a per-worktree test DB name at `--isolated` (`TEST_DATABASE` /
+> `TEST_DB_DATABASE` / `TEST_DATABASE_NAME` / `TEST_DATABASE_URL`); wire your
+> test config to it and run concurrent suites with `wt run --isolated`.
+
 - Jobs enqueued under `--isolated` need a worker started with the same flag;
   the main stack's worker only sees its own Redis DB.
 - `{n}` has 15 slots, so two worktrees can land on the same Redis DB — both
@@ -563,3 +598,12 @@ read-only over the container's copy in every compose run. Two things to know:
 mode on Alpine), `wt init` stack detection, the ruby and python3 + PyYAML
 YAML backends, isolation env export, and the server lifecycle including
 busy-port detection via bind probe and `ss`.
+
+---
+
+<div align="center">
+
+MIT © [Nguyen Van Sang](https://github.com/VSN2015) — issues and
+[template PRs for new stacks](#per-repo-setup) welcome.
+
+</div>
