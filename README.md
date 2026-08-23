@@ -20,15 +20,18 @@ auto-assigned ports, and opt-in isolation (own Redis DB number, own database).
 
 ```sh
 brew install VSN2015/tap/worktree-kit
-brew install yq   # skip if any yq v4 is already on your PATH (wt doctor checks)
 ```
 
 or from source:
 
 ```sh
 git clone https://github.com/VSN2015/worktree-kit && cd worktree-kit && ./install.sh
-brew install yq        # the one dependency (plus docker for compose repos)
 ```
+
+No dependencies to install on a Mac: wt reads its YAML config with whichever
+of yq, ruby, or python3 + PyYAML is already on your PATH (macOS ships ruby;
+`wt doctor` shows which one is in use). Compose repos additionally need
+docker.
 
 ## Per-repo setup
 

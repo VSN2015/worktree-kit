@@ -6,10 +6,12 @@
 # (own Redis DB number, own database) declared per repo in worktree-kit.yml.
 # Stack-agnostic: the core only executes commands the config declares.
 #
-# Dependencies: git, yq (v4). docker compose only for `runner: compose` repos.
+# Dependencies: git, plus one YAML reader — yq (v4), ruby, or python3 with
+# PyYAML (auto-detected; macOS ships ruby, so usually nothing to install).
+# docker compose only for `runner: compose` repos.
 set -eu
 
-WT_VERSION="0.1.1"
+WT_VERSION="0.1.2"
 
 die() { echo "wt: $*" >&2; exit 1; }
 note() { echo "wt: $*" >&2; }
@@ -21,7 +23,7 @@ slugify() { basename "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_' | se
 hashnum() { printf '%s' "$1" | cksum | cut -d' ' -f1; }
 
 ctx_init() {
-  need git; need yq
+  need git; yaml_backend
   WT_PATH="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
   GIT_COMMON="$(git rev-parse --path-format=absolute --git-common-dir)"
   PRIMARY="$(dirname "$GIT_COMMON")"
@@ -37,18 +39,82 @@ ctx_init() {
 
 require_config() {
   [ -f "$CONFIG" ] || die "no worktree-kit.yml at $PRIMARY — run 'wt init' in that repo"
-  RUNNER="$(cfg '.runner // "compose"')"
-  SERVICE="$(cfg '.compose.service // "app"')"
-  WORKDIR="$(cfg '.compose.workdir // "/app"')"
-  CONTAINER_PORT="$(cfg '.hooks.container_port // 3000')"
-  PREPARE="$(cfg '.hooks.prepare // ""')"
-  BUILD="$(cfg '.hooks.build // ""')"
-  SERVER_CMD="$(cfg '.hooks.server // ""')"
+  RUNNER="$(cfg_get runner compose)"
+  SERVICE="$(cfg_get compose.service app)"
+  WORKDIR="$(cfg_get compose.workdir /app)"
+  CONTAINER_PORT="$(cfg_get hooks.container_port 3000)"
+  PREPARE="$(cfg_get hooks.prepare "")"
+  BUILD="$(cfg_get hooks.build "")"
+  SERVER_CMD="$(cfg_get hooks.server "")"
   if [ "$RUNNER" = compose ]; then need docker; fi
 }
 
-cfg() { yq -r "$1" "$CONFIG"; }
-localcfg() { if [ -f "$LOCAL_CONFIG" ]; then yq -r "$1" "$LOCAL_CONFIG"; else echo ""; fi; }
+# ---------- yaml backend ----------
+# wt needs one YAML reader and uses whichever is already installed:
+# yq if present, else ruby (ships with macOS), else python3 + PyYAML.
+
+yaml_backend() {
+  if command -v yq >/dev/null 2>&1; then YAML_BACKEND=yq
+  elif command -v ruby >/dev/null 2>&1; then YAML_BACKEND=ruby
+  elif command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then YAML_BACKEND=python
+  else die "needs a YAML reader: yq, ruby, or python3 with PyYAML"
+  fi
+}
+
+WT_YAML_RB='
+require "yaml"
+mode, file, path, *extra = ARGV
+s = File.read(file)
+doc = (YAML.respond_to?(:unsafe_load) ? YAML.unsafe_load(s) : YAML.load(s)) || {}
+node = path.split(".").reduce(doc) { |d, k| d.is_a?(Hash) ? d[k] : nil }
+case mode
+when "get"   then puts(node.nil? ? extra[0].to_s : node)
+when "list"  then (node.is_a?(Array) ? node : []).each { |v| puts v }
+when "map"   then (node.is_a?(Hash) ? node : {}).each { |k, v| puts "#{k}=#{v}" }
+when "pairs" then (node.is_a?(Array) ? node : []).each { |h| puts "#{h[extra[0]]}:#{h[extra[1]]}" if h.is_a?(Hash) }
+end
+'
+
+WT_YAML_PY='
+import sys, yaml
+mode, file, path = sys.argv[1], sys.argv[2], sys.argv[3]
+extra = sys.argv[4:]
+with open(file) as f:
+    doc = yaml.safe_load(f) or {}
+node = doc
+for k in path.split("."):
+    node = node.get(k) if isinstance(node, dict) else None
+if mode == "get":
+    print(extra[0] if node is None else node)
+elif mode == "list":
+    for v in (node if isinstance(node, list) else []): print(v)
+elif mode == "map":
+    for k, v in (node if isinstance(node, dict) else {}).items(): print(f"{k}={v}")
+elif mode == "pairs":
+    for h in (node if isinstance(node, list) else []):
+        if isinstance(h, dict): print(f"{h[extra[0]]}:{h[extra[1]]}")
+'
+
+yamlq() { # <get|list|map|pairs> <file> <dotted.path> [default | key1 key2]
+  case "$YAML_BACKEND" in
+    yq)
+      mode="$1"; file="$2"; p=".\"$(printf '%s' "$3" | sed 's/\./"."/g')\""; shift 3
+      case "$mode" in
+        get)   yq -r "$p // \"${1:-}\"" "$file" ;;
+        list)  yq -r "${p}[]?" "$file" ;;
+        map)   yq -r "$p // {} | to_entries[] | .key + \"=\" + (.value | tostring)" "$file" ;;
+        pairs) yq -r "${p}[]? | .\"$1\" + \":\" + .\"$2\"" "$file" ;;
+      esac ;;
+    ruby)   ruby -e "$WT_YAML_RB" "$@" ;;
+    python) python3 -c "$WT_YAML_PY" "$@" ;;
+  esac
+}
+
+cfg_get()   { yamlq get   "$CONFIG" "$@"; }
+cfg_list()  { yamlq list  "$CONFIG" "$@"; }
+cfg_map()   { yamlq map   "$CONFIG" "$@"; }
+cfg_pairs() { yamlq pairs "$CONFIG" "$@"; }
+local_get() { if [ -f "$LOCAL_CONFIG" ]; then yamlq get "$LOCAL_CONFIG" "$@"; else echo ""; fi; }
 
 expand() {
   printf '%s' "$1" | sed \
@@ -63,7 +129,7 @@ worktree_paths() { git worktree list --porcelain | awk '/^worktree /{print $2}';
 port_free() { ! lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
 
 pick_port() {
-  pin="$(localcfg ".servers.\"$SLUG\".port // \"\"")"
+  pin="$(local_get "servers.$SLUG.port" "")"
   if [ -n "$pin" ]; then echo "$pin"; return; fi
   p=$(( 3000 + $(hashnum "$SLUG") % 900 ))
   while ! port_free "$p"; do p=$((p + 1)); done
@@ -74,10 +140,10 @@ pick_port() {
 
 # shared: nothing. isolated: isolated_env. own_db: isolated_env + own_db_env.
 detect_isolation() {
-  pin="$(localcfg ".servers.\"$SLUG\".isolation // \"\"" | tr - _)"
+  pin="$(local_get "servers.$SLUG.isolation" "" | tr - _)"
   if [ -n "$pin" ]; then echo "$pin"; return; fi
   [ "$WT_PATH" = "$PRIMARY" ] && { echo shared; return; }
-  for mp in $(cfg '.isolation.migration_paths[]? // ""'); do
+  for mp in $(cfg_list isolation.migration_paths); do
     [ -d "$WT_PATH/$mp" ] || continue
     for f in "$WT_PATH/$mp"/*; do
       [ -e "$f" ] || continue
@@ -90,12 +156,12 @@ detect_isolation() {
 iso_env_list() { # prints expanded KEY=VALUE lines for isolation level $1
   lvl="$1"
   if [ "$lvl" = isolated ] || [ "$lvl" = own_db ]; then
-    cfg '.isolation.isolated_env // {} | to_entries[] | .key + "=" + .value' | while IFS= read -r kv; do
+    cfg_map isolation.isolated_env | while IFS= read -r kv; do
       [ -n "$kv" ] && expand "$kv" && echo
     done
   fi
   if [ "$lvl" = own_db ]; then
-    cfg '.isolation.own_db_env // {} | to_entries[] | .key + "=" + .value' | while IFS= read -r kv; do
+    cfg_map isolation.own_db_env | while IFS= read -r kv; do
       [ -n "$kv" ] && expand "$kv" && echo
     done
   fi
@@ -105,11 +171,11 @@ iso_env_list() { # prints expanded KEY=VALUE lines for isolation level $1
 ensure_own_db() {
   marker="$STATE_DIR/$SLUG.dbready"
   [ -f "$marker" ] && return 0
-  check="$(cfg '.isolation.db_check // ""')"
+  check="$(cfg_get isolation.db_check "")"
   if [ -n "$check" ] && runner_exec own_db "$(expand "$check")" >/dev/null 2>&1; then
     touch "$marker"; return 0
   fi
-  boot="$(cfg '.isolation.db_bootstrap // ""')"
+  boot="$(cfg_get isolation.db_bootstrap "")"
   [ -n "$boot" ] || die "own-db needs isolation.db_bootstrap in worktree-kit.yml"
   note "bootstrapping isolated database for $SLUG ..."
   runner_exec own_db "$(expand "$boot")"
@@ -120,7 +186,7 @@ ensure_own_db() {
 
 compose_args() { # mounts + volumes + env for isolation level $1
   a="-v $WT_PATH:$WORKDIR -v $GIT_COMMON:$GIT_COMMON:ro"
-  for d in $(cfg '.mounts.read_only[]? // ""'); do
+  for d in $(cfg_list mounts.read_only); do
     [ -n "$d" ] && [ -e "$PRIMARY/$d" ] && a="$a -v $PRIMARY/$d:$WORKDIR/$d:ro"
   done
   if [ -d "$OVERLAY_DIR" ]; then
@@ -128,7 +194,7 @@ compose_args() { # mounts + volumes + env for isolation level $1
       a="$a -v $OVERLAY_DIR/$f:$WORKDIR/$f:ro"
     done
   fi
-  for v in $(cfg '.volumes[]? | .name + ":" + .path'); do
+  for v in $(cfg_pairs volumes name path); do
     name="$(expand "${v%%:*}")"
     docker volume create "$name" >/dev/null
     a="$a -v $name:${v#*:}"
@@ -327,7 +393,11 @@ cmd_doctor() {
   echo "primary:   $PRIMARY"
   echo "worktree:  $WT_PATH (slug: $SLUG, n: $N)"
   if [ -f "$CONFIG" ]; then require_config; echo "config:    $CONFIG (runner: $RUNNER)"; else echo "config:    MISSING — run wt init"; fi
-  command -v yq >/dev/null 2>&1 && echo "yq:        $(yq --version)" || echo "yq:        MISSING"
+  case "$YAML_BACKEND" in
+    yq)     echo "yaml:      $(yq --version)" ;;
+    ruby)   echo "yaml:      ruby $(ruby -e 'print RUBY_VERSION') (yq not needed)" ;;
+    python) echo "yaml:      python3 + PyYAML (yq not needed)" ;;
+  esac
   [ "${RUNNER:-compose}" = compose ] && { docker info >/dev/null 2>&1 && echo "docker:    up" || echo "docker:    DOWN"; }
   if [ -d "$OVERLAY_DIR" ]; then
     for f in $(cd "$OVERLAY_DIR" && find . -type f | sed 's|^\./||'); do

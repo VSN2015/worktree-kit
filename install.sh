@@ -10,4 +10,6 @@ case ":$PATH:" in
   *":$TARGET:"*) ;;
   *) echo "NOTE: $TARGET is not on your PATH — add it to your shell profile." ;;
 esac
-command -v yq >/dev/null 2>&1 || echo "NOTE: wt needs yq (brew install yq)."
+command -v yq >/dev/null 2>&1 || command -v ruby >/dev/null 2>&1 || \
+  { command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; } || \
+  echo "NOTE: wt needs a YAML reader: yq, ruby, or python3 with PyYAML."
