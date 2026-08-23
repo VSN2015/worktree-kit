@@ -367,7 +367,7 @@ running.
 |-----------------------------------------|-----------------------------------------------------|
 | `wt run [flags] [--] <cmd...>`          | one-off command in this worktree                    |
 | `wt server [flags] [port]`              | start this worktree's server, detached              |
-| `wt up [slug...]`                       | start servers for all (or the named) worktrees      |
+| `wt up [flags] [slug...]`               | start servers for all (or the named) worktrees      |
 | `wt down [slug...]`                     | stop servers — all of them, or the named ones       |
 | `wt ps`                                 | list running worktree servers                       |
 | `wt logs [slug]`                        | follow a server's logs                              |
@@ -376,9 +376,9 @@ running.
 | `wt init`                               | write `worktree-kit.yml` from a stack template      |
 | `wt doctor`                             | environment + config checks                         |
 
-The isolation flags `--shared` / `--isolated` / `--own-db` work on `run` and
-`server`; the [isolation](#isolation) section above covers what each level
-exports. `wt --help` prints this summary, `wt --version` the version — both
+The isolation flags `--shared` / `--isolated` / `--own-db` work on `run`,
+`server`, and `up`; the [isolation](#isolation) section above covers what
+each level exports. `wt --help` prints this summary, `wt --version` the version — both
 work outside a git repo.
 
 ### wt run — one-off commands
@@ -439,24 +439,28 @@ wt server --own-db     # force own dev database (bootstraps on first use)
 ### wt up — everything at once
 
 ```sh
-wt up [slug...]
+wt up [--shared|--isolated|--own-db] [slug...]
 ```
 
 Runs `wt server` in every worktree of the repo (the primary checkout is
 skipped), each with its own auto-assigned port and auto-detected isolation.
-Pass slugs to start only those. One worktree failing to start doesn't stop
-the others — a note is printed and `wt up` moves on. Works from anywhere in
-the repo, primary or worktree.
+Pass slugs to start only those; an isolation flag applies to every worktree
+being started (it's passed through to each `wt server`, so it beats
+`worktree-kit.local.yml` pins, like any CLI flag). One worktree failing to
+start doesn't stop the others — a note is printed and `wt up` moves on.
+Works from anywhere in the repo, primary or worktree.
 
 ```sh
-wt up                                  # a server for every worktree
+wt up                                  # a server for every worktree, auto isolation
 wt up myapp_phase02                    # just this one
 wt up myapp_phase02 myapp_fix_login    # these two
+wt up --own-db                         # every worktree on its own dev database
+wt up --own-db myapp_phase02           # just this one, forced to own-db
 ```
 
-`wt up` always uses the automatic choices; per-worktree pins in
-`worktree-kit.local.yml` still apply. To force a flag or port for one
-worktree, `cd` into it and run `wt server` there.
+Without a flag `wt up` uses the automatic choices, and per-worktree pins in
+`worktree-kit.local.yml` apply. Ports can't be set from `wt up` — pin one in
+`local.yml`, or `cd` into that worktree and run `wt server <port>`.
 
 ### wt down — stop servers
 

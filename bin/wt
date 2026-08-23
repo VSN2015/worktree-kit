@@ -11,7 +11,7 @@
 # docker compose only for `runner: compose` repos.
 set -eu
 
-WT_VERSION="0.1.4"
+WT_VERSION="0.1.5"
 
 die() { echo "wt: $*" >&2; exit 1; }
 note() { echo "wt: $*" >&2; }
@@ -296,13 +296,18 @@ cmd_server() {
 }
 
 cmd_up() {
+  LEVEL=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --isolated|--own-db|--shared) LEVEL="$1"; shift ;;
+    *) break ;;
+  esac; done
   for p in $(worktree_paths); do
     [ "$p" = "$PRIMARY" ] && continue
     s="$(slugify "$p")"
     if [ $# -gt 0 ]; then
       echo " $* " | grep -q " $s " || continue
     fi
-    ( cd "$p" && "$0" server ) || note "failed to start $s"
+    ( cd "$p" && "$0" server $LEVEL ) || note "failed to start $s"
   done
 }
 
@@ -427,7 +432,7 @@ wt — worktree-aware runner (config: worktree-kit.yml at the primary checkout)
 
   wt run [--shared|--isolated|--own-db] [--] <cmd...>   one-off command in this worktree
   wt server [--shared|--isolated|--own-db] [port]       start this worktree's server (auto port + isolation)
-  wt up [slug...]        start servers for all (or named) worktrees
+  wt up [--shared|--isolated|--own-db] [slug...]        start servers for all (or named) worktrees
   wt down [slug...]      stop servers
   wt ps                  list running worktree servers
   wt logs [slug]         follow a server's logs
