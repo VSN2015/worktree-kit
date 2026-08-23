@@ -355,15 +355,175 @@ Two consequences of how slugs work:
 
 ## Daily use
 
+Every command takes its context from the directory you run it in: `wt`
+resolves the primary checkout through git, reads `worktree-kit.yml` from
+there, and derives this worktree's **slug** from its directory name
+(lowercased, non-alphanumeric → `_`, so `../myapp-fix-login` becomes
+`myapp_fix_login`). Commands that name a worktree (`up`, `down`, `logs`,
+`reset`) take that slug, not a path — `wt ps` shows the slugs of everything
+running.
+
+| command                                 | what it does                                        |
+|-----------------------------------------|-----------------------------------------------------|
+| `wt run [flags] [--] <cmd...>`          | one-off command in this worktree                    |
+| `wt server [flags] [port]`              | start this worktree's server, detached              |
+| `wt up [slug...]`                       | start servers for all (or the named) worktrees      |
+| `wt down [slug...]`                     | stop servers — all of them, or the named ones       |
+| `wt ps`                                 | list running worktree servers                       |
+| `wt logs [slug]`                        | follow a server's logs                              |
+| `wt localize <file...>`                 | snapshot a personal overlay (`--list` / `--remove`) |
+| `wt reset [slug]`                       | clear the own-db bootstrap marker                   |
+| `wt init`                               | write `worktree-kit.yml` from a stack template      |
+| `wt doctor`                             | environment + config checks                         |
+
+The isolation flags `--shared` / `--isolated` / `--own-db` work on `run` and
+`server`; the [isolation](#isolation) section above covers what each level
+exports. `wt --help` prints this summary, `wt --version` the version — both
+work outside a git repo.
+
+### wt run — one-off commands
+
 ```sh
-wt run bundle exec rspec spec/models/foo_spec.rb   # one-off in this worktree (shared test DB)
-wt run --isolated bundle exec rspec spec/          # own test DB — safe to run in many worktrees at once
-wt server            # this worktree's server: auto port + auto isolation
-wt up                # servers for every worktree
-wt ps / wt logs / wt down
-wt localize config/database.yml   # personal overlay (see below)
-wt doctor            # checks, including stale overlays
+wt run [--shared|--isolated|--own-db] [--] <command...>
 ```
+
+Runs one command in this worktree and exits. The `prepare` hook runs first
+(both runners), then the command — in a fresh `docker compose run --rm`
+container with the worktree mounted over `compose.workdir` (compose runner),
+or as a plain process in the worktree directory (host runner). When attached
+to a terminal the compose runner allocates a TTY, so interactive commands
+like a Rails console work.
+
+The default level is `--shared` (nothing exported) — fine for one-offs, but
+concurrent test suites need `--isolated` (see [Caveats](#caveats)).
+`--own-db` bootstraps this worktree's database on first use. Flags come
+before the command — parsing stops at the first word that isn't an isolation
+flag (or at a literal `--`, for the rare command that itself starts with one).
+
+```sh
+wt run bundle exec rspec spec/models/foo_spec.rb   # shared: hits the primary's test DB
+wt run --isolated bundle exec rspec spec/          # own test DB — safe in many worktrees at once
+wt run --own-db bin/rails db:migrate               # against this worktree's own dev DB
+wt run bin/rails console                           # interactive — the TTY passes through
+wt run --isolated bundle exec rake resque:work     # a worker polling this worktree's Redis DB
+```
+
+### wt server — this worktree's server
+
+```sh
+wt server [--shared|--isolated|--own-db] [port]
+```
+
+Starts the `hooks.server` command detached (after `prepare` and `build`) and
+prints the URL. Without a flag the level is chosen automatically: a
+`worktree-kit.local.yml` pin wins; the primary checkout is always `shared`;
+a worktree whose `migration_paths` contain files the primary lacks escalates
+to `own_db`; everything else runs `isolated`.
+
+The port likewise: an explicit positional port beats a `local.yml` pin,
+which beats the stable slug hash in 3000–3899 (bumped upward until free).
+Explicit and pinned ports are checked but never bumped — `wt server` refuses
+to start if one is busy. It also refuses if this slug already has a running
+server (`wt down <slug>` first).
+
+Compose runner: a detached container named `wt-<project>-<slug>` publishing
+`<port>:<container_port>`. Host runner: a nohup'd process with a pidfile
+under `.git/wt-state/`, logging to `.git/wt-state/logs/<slug>.log`.
+
+```sh
+wt server              # auto port + auto isolation
+wt server 3050         # this exact port (refuses if busy)
+wt server --own-db     # force own dev database (bootstraps on first use)
+```
+
+### wt up — everything at once
+
+```sh
+wt up [slug...]
+```
+
+Runs `wt server` in every worktree of the repo (the primary checkout is
+skipped), each with its own auto-assigned port and auto-detected isolation.
+Pass slugs to start only those. One worktree failing to start doesn't stop
+the others — a note is printed and `wt up` moves on. Works from anywhere in
+the repo, primary or worktree.
+
+```sh
+wt up                                  # a server for every worktree
+wt up myapp_phase02                    # just this one
+wt up myapp_phase02 myapp_fix_login    # these two
+```
+
+`wt up` always uses the automatic choices; per-worktree pins in
+`worktree-kit.local.yml` still apply. To force a flag or port for one
+worktree, `cd` into it and run `wt server` there.
+
+### wt down — stop servers
+
+```sh
+wt down [slug...]
+```
+
+With no arguments stops **every** running worktree server of this repo; with
+slugs, just those. Compose containers are removed on stop (they run with
+`--rm`); host processes are killed and their pidfiles cleaned up.
+
+```sh
+wt down                 # stop them all
+wt down myapp_phase02   # stop one
+```
+
+### wt ps — what's running
+
+Lists this repo's running worktree servers: slug, isolation level, URL, and
+status. On the compose runner this reads container labels; on the host
+runner it reads the pidfiles and reports `running` or `dead`.
+
+```
+myapp_phase02   isolated   http://localhost:3247   Up 2 hours
+myapp_fix_login own_db     http://localhost:3105   Up 20 minutes
+```
+
+### wt logs — follow a server
+
+```sh
+wt logs [slug]
+```
+
+Follows a server's output (like `tail -f`); Ctrl-C stops following, not the
+server. The slug defaults to the current worktree, so a bare `wt logs`
+inside a worktree does the right thing. One runner difference: compose logs
+live with the container, so they're gone once that server is stopped; host
+logs persist in `.git/wt-state/logs/<slug>.log`.
+
+### wt localize — personal overlays
+
+```sh
+wt localize config/database.yml               # snapshot (re-run after editing the source)
+wt localize --list                            # what's overlaid
+wt localize --remove config/database.yml      # drop an overlay
+```
+
+Snapshots a tracked file into `.git/local/` to be mounted read-only over the
+container's copy — details in [Overlays](#overlays-wt-localize) below.
+
+### wt reset — re-bootstrap an own-db worktree
+
+```sh
+wt reset [slug]      # defaults to the current worktree
+```
+
+Clears the marker that records "this worktree's database was bootstrapped",
+so the next `--own-db` run bootstraps again. It only clears the marker — the
+`wt_<slug>` database itself is never dropped; that's yours.
+
+### wt init / wt doctor — setup and checks
+
+`wt init` detects the stack and writes `worktree-kit.yml` (see
+[Per-repo setup](#per-repo-setup)). `wt doctor` prints the version, primary
+and worktree paths with slug and `{n}`, the config and runner in use, which
+YAML backend was auto-detected, whether docker is up (compose repos), and
+flags stale overlays. Run it after any config change.
 
 ## Overlays (`wt localize`)
 
