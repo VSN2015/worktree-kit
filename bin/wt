@@ -11,7 +11,7 @@
 # docker compose only for `runner: compose` repos.
 set -eu
 
-WT_VERSION="0.1.3"
+WT_VERSION="0.1.4"
 
 die() { echo "wt: $*" >&2; exit 1; }
 note() { echo "wt: $*" >&2; }
