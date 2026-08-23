@@ -10,7 +10,7 @@ jobs:
       matrix:
         distro: [debian, alpine]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: ./test/linux.sh ${{ matrix.distro }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
