@@ -1,0 +1,36 @@
+{
+  "name": "worktree-kit",
+  "version": "0.1.3",
+  "description": "wt — run commands and app servers per git worktree, with per-worktree database/Redis isolation",
+  "bin": {
+    "wt": "bin/wt"
+  },
+  "files": [
+    "bin",
+    "templates"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VSN2015/worktree-kit.git"
+  },
+  "homepage": "https://github.com/VSN2015/worktree-kit#readme",
+  "bugs": "https://github.com/VSN2015/worktree-kit/issues",
+  "keywords": [
+    "git",
+    "worktree",
+    "cli",
+    "dev-server",
+    "isolation",
+    "parallel-development",
+    "rails",
+    "laravel",
+    "django",
+    "monorepo"
+  ],
+  "author": "Nguyen Van Sang",
+  "license": "MIT"
+}
