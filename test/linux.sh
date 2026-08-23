@@ -6,7 +6,7 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 
 run_one() {
   echo "=== $1 ($2)"
-  docker run --rm -v "$repo:/src:ro" "$2" sh "/src/test/linux-$1.sh"
+  docker run --rm -e GITHUB_TOKEN -v "$repo:/src:ro" "$2" sh "/src/test/linux-$1.sh"
 }
 
 case "${1:-all}" in

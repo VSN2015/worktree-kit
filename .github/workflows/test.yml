@@ -1,0 +1,16 @@
+name: test
+on: push
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [debian, alpine]
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./test/linux.sh ${{ matrix.distro }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

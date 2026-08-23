@@ -9,13 +9,19 @@ TARGET="${1:-$HOME/.local/bin}"
 
 KIT="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo "")"
 if [ -z "$KIT" ] || [ ! -f "$KIT/bin/wt" ]; then
-  # no local checkout (curl | sh): fetch the latest release tarball
+  # no local checkout (curl | sh): fetch the latest release tarball.
+  # GITHUB_TOKEN (if set) authenticates the API call — shared CI runner IPs
+  # exhaust the unauthenticated rate limit.
+  fetch() {
+    if [ -n "${GITHUB_TOKEN:-}" ]; then curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$1"
+    else curl -fsSL "$1"; fi
+  }
   KIT="${WT_HOME:-$HOME/.local/share/worktree-kit}"
-  tag="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" |
+  tag="$(fetch "https://api.github.com/repos/$REPO/releases/latest" |
     sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
   [ -n "$tag" ] || { echo "install.sh: could not determine the latest release of $REPO" >&2; exit 1; }
   rm -rf "$KIT" && mkdir -p "$KIT"
-  curl -fsSL "https://github.com/$REPO/archive/refs/tags/$tag.tar.gz" | tar xz -C "$KIT" --strip-components=1
+  fetch "https://github.com/$REPO/archive/refs/tags/$tag.tar.gz" | tar xz -C "$KIT" --strip-components=1
   echo "downloaded: worktree-kit $tag -> $KIT"
 fi
 
