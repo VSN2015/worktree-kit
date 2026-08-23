@@ -388,3 +388,11 @@ read-only over the container's copy in every compose run. Two things to know:
   print their `n` at start; pin one in `worktree-kit.local.yml` if they meet.
 - Rails ≤ 7: a bare `db:schema:load` in development also reloads the TEST
   database — keep `SKIP_TEST_DATABASE=1` in `db_bootstrap` (templates do).
+
+## Testing
+
+`./test/linux.sh [debian|alpine]` runs the Linux suite in containers
+(requires docker): install (clone symlink on Debian, `curl | sh` remote
+mode on Alpine), `wt init` stack detection, the ruby and python3 + PyYAML
+YAML backends, isolation env export, and the server lifecycle including
+busy-port detection via bind probe and `ss`.
