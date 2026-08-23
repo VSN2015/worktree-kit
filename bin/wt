@@ -11,7 +11,7 @@
 # docker compose only for `runner: compose` repos.
 set -eu
 
-WT_VERSION="0.1.2"
+WT_VERSION="0.1.3"
 
 die() { echo "wt: $*" >&2; exit 1; }
 note() { echo "wt: $*" >&2; }
@@ -126,7 +126,21 @@ worktree_paths() { git worktree list --porcelain | awk '/^worktree /{print $2}';
 
 # ---------- ports ----------
 
-port_free() { ! lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
+# lsof (macOS) -> ss (Linux) -> bind probe via ruby/python3 -> assume free.
+# BusyBox's lsof applet ignores flags and always exits 0 — skip it.
+port_free() {
+  if command -v lsof >/dev/null 2>&1 && ! lsof -h 2>&1 | grep -qi busybox; then
+    ! lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+  elif command -v ss >/dev/null 2>&1; then
+    ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$1\$"
+  elif command -v ruby >/dev/null 2>&1; then
+    ruby -rsocket -e 'TCPServer.new("127.0.0.1", ARGV[0].to_i).close' "$1" 2>/dev/null
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import socket,sys; s=socket.socket(); s.bind(("127.0.0.1",int(sys.argv[1]))); s.close()' "$1" 2>/dev/null
+  else
+    return 0
+  fi
+}
 
 pick_port() {
   pin="$(local_get "servers.$SLUG.port" "")"

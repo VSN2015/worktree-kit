@@ -19,7 +19,11 @@ auto-assigned ports, and opt-in isolation (own Redis DB number, own database).
 ## Install
 
 ```sh
+# macOS or Linux, with Homebrew
 brew install VSN2015/tap/worktree-kit
+
+# any Linux (or macOS) without Homebrew — downloads the latest release
+curl -fsSL https://raw.githubusercontent.com/VSN2015/worktree-kit/master/install.sh | sh
 ```
 
 or from source:
@@ -28,10 +32,12 @@ or from source:
 git clone https://github.com/VSN2015/worktree-kit && cd worktree-kit && ./install.sh
 ```
 
-No dependencies to install on a Mac: wt reads its YAML config with whichever
-of yq, ruby, or python3 + PyYAML is already on your PATH (macOS ships ruby;
-`wt doctor` shows which one is in use). Compose repos additionally need
-docker.
+wt is POSIX sh and runs on macOS and Linux (tested on glibc/Debian and
+musl/Alpine). There are usually no dependencies to install: it reads its
+YAML config with whichever of yq, ruby, or python3 + PyYAML is already on
+your PATH (macOS ships ruby; `wt doctor` shows which one is in use), and
+checks ports with lsof, ss, or a ruby/python bind probe — whichever exists.
+Compose repos additionally need docker.
 
 ## Per-repo setup
 
