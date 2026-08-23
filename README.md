@@ -22,7 +22,10 @@ auto-assigned ports, and opt-in isolation (own Redis DB number, own database).
 # macOS or Linux, with Homebrew
 brew install VSN2015/tap/worktree-kit
 
-# any Linux (or macOS) without Homebrew — downloads the latest release
+# with npm (or try it one-off: npx worktree-kit doctor)
+npm install -g worktree-kit
+
+# any Linux (or macOS) without Homebrew or npm — downloads the latest release
 curl -fsSL https://raw.githubusercontent.com/VSN2015/worktree-kit/master/install.sh | sh
 ```
 
