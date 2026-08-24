@@ -251,7 +251,7 @@ Usable in every hook command and env value:
 
 | variable           | value                                                  |
 |--------------------|--------------------------------------------------------|
-| `{slug}`           | worktree dir name, lowercased (`phase02`)              |
+| `{slug}`           | worktree dir name, lowercased, ≤ 40 chars (`phase02`)  |
 | `{n}`              | stable per-slug number 1–15 (Redis DB slot)            |
 | `{port}`           | the host port (set for `wt server`; empty in `wt run`) |
 | `{container_port}` | `hooks.container_port`                                 |
@@ -385,7 +385,9 @@ Two consequences of how slugs work:
 - The worktree **directory name becomes the slug** (lowercased,
   non-alphanumeric → `_`), and the slug drives the port hash and the Redis
   `{n}` slot — so name worktree dirs distinctly (`../myapp-phase02`, not
-  `../wt2`).
+  `../wt2`). Names longer than 40 chars are cut to a prefix plus a checksum
+  of the full name, so `wt_{slug}_test`-style database names always fit
+  inside the 63/64-char identifier limits of postgres/mysql.
 - The worktree itself carries no config; running `wt` from the primary
   checkout also works and is always treated as `shared`.
 

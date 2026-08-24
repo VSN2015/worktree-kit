@@ -63,6 +63,14 @@ wt server 4321 2>&1 | grep -q 'port 4321 is busy' && echo "ruby probe: busy dete
 apt-get install -y -qq --no-install-recommends iproute2 >/dev/null
 wt server 4321 2>&1 | grep -q 'port 4321 is busy' && echo "ss: busy detected"
 
+# long dir names: slug capped at 40 chars (prefix + cksum) so DB names built
+# from it, like wt_{slug}_test, fit postgres/mysql identifier limits
+long=/tmp/app_with_a_truly_extremely_long_worktree_directory_name_overflowing_db_identifier_limits
+mkdir "$long" && cd "$long" && git init -q && cp /tmp/app/worktree-kit.yml .
+slug="$(wt doctor | sed -n 's/.*(slug: \([^,]*\),.*/\1/p')"
+test "${#slug}" -le 40
+wt run --isolated -- env | grep -q "^TEST_DATABASE=wt_${slug}_test\$" && echo "long slug capped: $slug"
+
 cd /tmp/app && wt down
 wt ps | grep -q running && exit 1 || true
 # down must kill the real server, not just the sh -c wrapper
