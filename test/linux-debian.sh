@@ -24,7 +24,9 @@ grep -q 'runner:' worktree-kit.yml
 cat > worktree-kit.yml <<'EOF'
 runner: host
 hooks:
-  server: "ruby /tmp/app/server.rb {port}"
+  # compound on purpose: forces an sh -c wrapper layer, so this suite
+  # catches the orphaned-server bug (down must kill the process group)
+  server: "true && ruby /tmp/app/server.rb {port}"
 isolation:
   isolated_env:
     REDIS_URL: "redis://localhost:6379/{n}"
@@ -63,4 +65,6 @@ wt server 4321 2>&1 | grep -q 'port 4321 is busy' && echo "ss: busy detected"
 
 cd /tmp/app && wt down
 wt ps | grep -q running && exit 1 || true
+# down must kill the real server, not just the sh -c wrapper
+curl -fsS -m 2 http://localhost:4321/ >/dev/null 2>&1 && exit 1 || echo "port freed — no orphan"
 echo "DEBIAN PASS"

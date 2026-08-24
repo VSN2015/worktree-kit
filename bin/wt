@@ -13,7 +13,7 @@
 # docker compose only for `runner: compose` repos.
 set -eu
 
-WT_VERSION="0.1.6"
+WT_VERSION="0.1.7"
 
 die() { echo "wt: $*" >&2; exit 1; }
 note() { echo "wt: $*" >&2; }
@@ -419,7 +419,20 @@ cmd_server() {
     fi
     envs="$(iso_env_list "$LEVEL" | tr '\n' ' ')"
     log="$STATE_DIR/logs/$SLUG.log"
-    ( cd "$WT_PATH" && env $envs nohup sh -c "$cmd" > "$log" 2>&1 & echo $! > "$pidfile" )
+    # The server gets its own process group so wt down can kill the whole
+    # tree (sh -c wrapper, server, its children) — killing only the pidfile
+    # pid used to orphan the server and leave the port occupied. setsid
+    # exists on Linux/BusyBox; macOS has none but its bash honors set -m.
+    (
+      cd "$WT_PATH" || exit 1
+      if command -v setsid >/dev/null 2>&1; then
+        env $envs nohup setsid sh -c "$cmd" > "$log" 2>&1 &
+      else
+        set -m 2>/dev/null || :
+        env $envs nohup sh -c "$cmd" > "$log" 2>&1 &
+      fi
+      echo $! > "$pidfile"
+    )
     echo "$PORT" > "$STATE_DIR/$SLUG.port"
     note "$SLUG [$LEVEL] -> http://localhost:$PORT  (pid $(cat "$pidfile"), logs: wt logs $SLUG)"
   fi
@@ -458,7 +471,10 @@ cmd_down() {
       [ -e "$f" ] || continue
       s="$(basename "$f" .pid)"
       if [ $# -gt 0 ]; then echo " $* " | grep -q " $s " || continue; fi
-      kill "$(cat "$f")" 2>/dev/null || true
+      pid="$(cat "$f")"
+      # the pid is a process-group leader (see cmd_server); kill the whole
+      # group, falling back to the bare pid for pre-group pidfiles
+      kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
       rm -f "$f" "$STATE_DIR/$s.port"; note "stopped $s"
     done
   fi
@@ -488,6 +504,7 @@ cmd_logs() {
   if [ "$RUNNER" = compose ]; then
     exec docker logs -f "wt-$PROJECT-$s"
   else
+    [ -f "$STATE_DIR/logs/$s.log" ] || die "no logs for $s — was it ever started here?"
     exec tail -f "$STATE_DIR/logs/$s.log"
   fi
 }
@@ -495,7 +512,10 @@ cmd_logs() {
 cmd_localize() {
   case "${1:-}" in
     --list) if [ -d "$OVERLAY_DIR" ]; then cd "$OVERLAY_DIR" && find . -type f | sed 's|^\./||'; fi; return 0 ;;
-    --remove) shift; for p in "$@"; do rm -f "$OVERLAY_DIR/$p" && note "removed overlay: $p"; done; return ;;
+    --remove) shift; for p in "$@"; do
+        if [ -f "$OVERLAY_DIR/$p" ]; then rm -f "$OVERLAY_DIR/$p"; note "removed overlay: $p"
+        else note "no overlay: $p"; fi
+      done; return ;;
     '') die "usage: wt localize <tracked-file>... | --list | --remove <file>..." ;;
   esac
   for p in "$@"; do
