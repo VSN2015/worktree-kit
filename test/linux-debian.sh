@@ -40,7 +40,10 @@ loop do
 end
 EOF
 
-wt doctor | grep 'yaml:.*ruby'
+wt doctor | grep 'yaml:.*ruby'   # this first read also builds the config cache
+wt doctor | grep -q 'cache: hit'
+echo '# edited' >> worktree-kit.yml
+wt doctor | grep -q 'cache: rebuilt'
 wt run --isolated -- env | grep -E '^(REDIS_URL|TEST_DATABASE)=' | sort
 
 # server lifecycle on the ruby bind-probe port check

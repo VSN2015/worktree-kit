@@ -8,10 +8,12 @@
 #
 # Dependencies: git, plus one YAML reader — yq (v4), ruby, or python3 with
 # PyYAML (auto-detected; macOS ships ruby, so usually nothing to install).
+# The reader only runs when the config changes: parsed config is cached as
+# shell assignments under <git-common>/wt-state/ and sourced on every run.
 # docker compose only for `runner: compose` repos.
 set -eu
 
-WT_VERSION="0.1.5"
+WT_VERSION="0.1.6"
 
 die() { echo "wt: $*" >&2; exit 1; }
 note() { echo "wt: $*" >&2; }
@@ -23,7 +25,7 @@ slugify() { basename "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_' | se
 hashnum() { printf '%s' "$1" | cksum | cut -d' ' -f1; }
 
 ctx_init() {
-  need git; yaml_backend
+  need git
   WT_PATH="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
   GIT_COMMON="$(git rev-parse --path-format=absolute --git-common-dir)"
   PRIMARY="$(dirname "$GIT_COMMON")"
@@ -39,6 +41,7 @@ ctx_init() {
 
 require_config() {
   [ -f "$CONFIG" ] || die "no worktree-kit.yml at $PRIMARY — run 'wt init' in that repo"
+  load_config
   RUNNER="$(cfg_get runner compose)"
   SERVICE="$(cfg_get compose.service app)"
   WORKDIR="$(cfg_get compose.workdir /app)"
@@ -50,71 +53,198 @@ require_config() {
 }
 
 # ---------- yaml backend ----------
-# wt needs one YAML reader and uses whichever is already installed:
-# yq if present, else ruby (ships with macOS), else python3 + PyYAML.
+# wt needs a YAML reader only to (re)build the config cache: yq if present,
+# else ruby (ships with macOS), else python3 + PyYAML. Every lookup after
+# that is pure shell — the hot path spawns no interpreter at all.
 
 yaml_backend() {
   if command -v yq >/dev/null 2>&1; then YAML_BACKEND=yq
   elif command -v ruby >/dev/null 2>&1; then YAML_BACKEND=ruby
   elif command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then YAML_BACKEND=python
-  else die "needs a YAML reader: yq, ruby, or python3 with PyYAML"
+  else YAML_BACKEND=""
   fi
 }
 
-WT_YAML_RB='
+# Each dumper flattens one whole YAML file into shell assignments, depth-first:
+#   scalar at a.b -> PREFIX_a_b='value'          (null values are skipped)
+#   map at a      -> PREFIX_a__keys='k1<NL>k2'   plus one entry per key
+#   list at a     -> PREFIX_a__len=N             plus PREFIX_a_0, PREFIX_a_1...
+# Path segments are sanitized [^A-Za-z0-9] -> _ (cfg_var mirrors this).
+# The ruby/python sources build quote/backslash/newline from char codes
+# (39/92/10) so the scripts can live inside single-quoted sh strings.
+
+WT_DUMP_RB='
 require "yaml"
-mode, file, path, *extra = ARGV
+file, prefix = ARGV
 s = File.read(file)
 doc = (YAML.respond_to?(:unsafe_load) ? YAML.unsafe_load(s) : YAML.load(s)) || {}
-node = path.split(".").reduce(doc) { |d, k| d.is_a?(Hash) ? d[k] : nil }
-case mode
-when "get"   then puts(node.nil? ? extra[0].to_s : node)
-when "list"  then (node.is_a?(Array) ? node : []).each { |v| puts v }
-when "map"   then (node.is_a?(Hash) ? node : {}).each { |k, v| puts "#{k}=#{v}" }
-when "pairs" then (node.is_a?(Array) ? node : []).each { |h| puts "#{h[extra[0]]}:#{h[extra[1]]}" if h.is_a?(Hash) }
+Q = 39.chr
+def shq(v) Q + v.to_s.gsub(Q) { Q + 92.chr + Q + Q } + Q end
+def san(k) k.to_s.gsub(/[^A-Za-z0-9]/, "_") end
+def emit(n, var)
+  case n
+  when Hash
+    puts "#{var}__keys=#{shq(n.keys.join(10.chr))}" unless n.empty?
+    n.each { |k, v| emit(v, "#{var}_#{san(k)}") }
+  when Array
+    puts "#{var}__len=#{n.length}"
+    n.each_with_index { |v, i| emit(v, "#{var}_#{i}") }
+  when nil
+  else
+    puts "#{var}=#{shq(n)}"
+  end
 end
+emit(doc, prefix)
 '
 
-WT_YAML_PY='
-import sys, yaml
-mode, file, path = sys.argv[1], sys.argv[2], sys.argv[3]
-extra = sys.argv[4:]
+WT_DUMP_PY='
+import re, sys, yaml
+file, prefix = sys.argv[1], sys.argv[2]
 with open(file) as f:
     doc = yaml.safe_load(f) or {}
-node = doc
-for k in path.split("."):
-    node = node.get(k) if isinstance(node, dict) else None
-if mode == "get":
-    print(extra[0] if node is None else node)
-elif mode == "list":
-    for v in (node if isinstance(node, list) else []): print(v)
-elif mode == "map":
-    for k, v in (node if isinstance(node, dict) else {}).items(): print(f"{k}={v}")
-elif mode == "pairs":
-    for h in (node if isinstance(node, list) else []):
-        if isinstance(h, dict): print(f"{h[extra[0]]}:{h[extra[1]]}")
+q = chr(39)
+def shq(v):
+    return q + str(v).replace(q, q + chr(92) + q + q) + q
+def san(k):
+    return re.sub("[^A-Za-z0-9]", "_", str(k))
+def emit(n, var):
+    if isinstance(n, dict):
+        if n:
+            print(var + "__keys=" + shq(chr(10).join(str(k) for k in n)))
+        for k, v in n.items():
+            emit(v, var + "_" + san(k))
+    elif isinstance(n, list):
+        print(var + "__len=" + str(len(n)))
+        for i, v in enumerate(n):
+            emit(v, var + "_" + str(i))
+    elif n is None:
+        pass
+    elif n is True:
+        print(var + "=" + shq("true"))
+    elif n is False:
+        print(var + "=" + shq("false"))
+    else:
+        print(var + "=" + shq(n))
+emit(doc, prefix)
 '
 
-yamlq() { # <get|list|map|pairs> <file> <dotted.path> [default | key1 key2]
+yq_dump() { # <file> <prefix>
+  P="$2" yq -r --from-file /dev/stdin "$1" <<'EOF'
+(
+  .. | select(tag == "!!map" and length > 0) |
+    ([strenv(P)] + (path | map(tostring) | map(sub("[^A-Za-z0-9]", "_"))) | join("_"))
+    + "__keys=" + ((keys | map(tostring) | join("\n")) | "'" + sub("'", "'\\''") + "'")
+),
+(
+  .. | select(tag == "!!seq") |
+    ([strenv(P)] + (path | map(tostring) | map(sub("[^A-Za-z0-9]", "_"))) | join("_"))
+    + "__len=" + (length | tostring)
+),
+(
+  .. | select(tag != "!!map" and tag != "!!seq" and tag != "!!null") |
+    ([strenv(P)] + (path | map(tostring) | map(sub("[^A-Za-z0-9]", "_"))) | join("_"))
+    + "=" + (tostring | "'" + sub("'", "'\\''") + "'")
+)
+EOF
+}
+
+dump_config() { # <file> <prefix>
   case "$YAML_BACKEND" in
-    yq)
-      mode="$1"; file="$2"; p=".\"$(printf '%s' "$3" | sed 's/\./"."/g')\""; shift 3
-      case "$mode" in
-        get)   yq -r "$p // \"${1:-}\"" "$file" ;;
-        list)  yq -r "${p}[]?" "$file" ;;
-        map)   yq -r "$p // {} | to_entries[] | .key + \"=\" + (.value | tostring)" "$file" ;;
-        pairs) yq -r "${p}[]? | .\"$1\" + \":\" + .\"$2\"" "$file" ;;
-      esac ;;
-    ruby)   ruby -e "$WT_YAML_RB" "$@" ;;
-    python) python3 -c "$WT_YAML_PY" "$@" ;;
+    yq)     yq_dump "$1" "$2" ;;
+    ruby)   ruby -e "$WT_DUMP_RB" "$1" "$2" ;;
+    python) python3 -c "$WT_DUMP_PY" "$1" "$2" ;;
   esac
 }
 
-cfg_get()   { yamlq get   "$CONFIG" "$@"; }
-cfg_list()  { yamlq list  "$CONFIG" "$@"; }
-cfg_map()   { yamlq map   "$CONFIG" "$@"; }
-cfg_pairs() { yamlq pairs "$CONFIG" "$@"; }
-local_get() { if [ -f "$LOCAL_CONFIG" ]; then yamlq get "$LOCAL_CONFIG" "$@"; else echo ""; fi; }
+# ---------- config cache ----------
+# Both YAML files are flattened once into $STATE_DIR/config.cache (WT_CFG_*
+# for worktree-kit.yml, WT_LCFG_* for the .local variant) and sourced. The
+# cache header records a cksum signature of the file contents; any content
+# change, the local file appearing or disappearing, or a format bump makes
+# the header mismatch and triggers a rebuild. (Checksums, not mtimes:
+# BusyBox test -nt only has whole-second granularity.) Deleting the cache
+# file also forces a rebuild.
+
+load_config() {
+  [ -n "${WT_CFG_SRC:-}" ] && return 0
+  _cache="$STATE_DIR/config.cache"
+  _hl=0; [ -f "$LOCAL_CONFIG" ] && _hl=1
+  _sig="$(cksum < "$CONFIG")"
+  [ "$_hl" = 1 ] && _sig="$_sig local $(cksum < "$LOCAL_CONFIG")"
+  _want="# wt-cache 1 $_sig"
+  if [ -f "$_cache" ]; then
+    IFS= read -r _first < "$_cache" || _first=""
+    if [ "$_first" = "$_want" ]; then
+      . "$_cache"
+      WT_CFG_SRC=hit
+      return 0
+    fi
+  fi
+  yaml_backend
+  [ -n "$YAML_BACKEND" ] || die "needs a YAML reader: yq, ruby, or python3 with PyYAML"
+  if ! {
+    echo "$_want" &&
+    dump_config "$CONFIG" WT_CFG &&
+    { [ "$_hl" = 0 ] || dump_config "$LOCAL_CONFIG" WT_LCFG; }
+  } > "$_cache.$$"; then
+    rm -f "$_cache.$$"
+    _bad="$CONFIG"; [ "$_hl" = 1 ] && _bad="$_bad (or $LOCAL_CONFIG)"
+    die "could not parse $_bad — check the YAML"
+  fi
+  mv "$_cache.$$" "$_cache"
+  . "$_cache"
+  WT_CFG_SRC=rebuilt
+}
+
+# ---------- config lookups (pure shell over the sourced cache) ----------
+
+cfg_var() { # dotted.path -> $CV: dots become _, matching the dumpers
+  CV=""; _in="$1"
+  while :; do case "$_in" in
+    *.*) CV="$CV${_in%%.*}_"; _in="${_in#*.}" ;;
+    *)   CV="$CV$_in"; break ;;
+  esac; done
+}
+
+cfg_get() { # <dotted.path> [default] — scalar; default when absent or null
+  cfg_var "$1"; _d="${2:-}"
+  eval "printf '%s\n' \"\${WT_CFG_$CV-\$_d}\""
+}
+
+cfg_list() { # <dotted.path> — list items, one per line
+  cfg_var "$1"
+  eval "_n=\${WT_CFG_${CV}__len-0}"
+  _i=0
+  while [ "$_i" -lt "$_n" ]; do
+    eval "printf '%s\n' \"\${WT_CFG_${CV}_$_i-}\""
+    _i=$((_i + 1))
+  done
+}
+
+cfg_map() { # <dotted.path> — KEY=VALUE per line (env-style keys only)
+  cfg_var "$1"
+  eval "_ks=\${WT_CFG_${CV}__keys-}"
+  [ -n "$_ks" ] || return 0
+  printf '%s\n' "$_ks" | while IFS= read -r _k; do
+    case "$_k" in ''|*[!A-Za-z0-9_]*) continue ;; esac
+    eval "printf '%s=%s\n' \"\$_k\" \"\${WT_CFG_${CV}_$_k-}\""
+  done
+}
+
+cfg_pairs() { # <dotted.path> <key1> <key2> — "v1:v2" per line for hash lists
+  cfg_var "$1"; _b="WT_CFG_$CV"
+  eval "_n=\${${_b}__len-0}"
+  _i=0
+  while [ "$_i" -lt "$_n" ]; do
+    eval "printf '%s:%s\n' \"\${${_b}_${_i}_$2-}\" \"\${${_b}_${_i}_$3-}\""
+    _i=$((_i + 1))
+  done
+}
+
+local_get() { # <dotted.path> [default] — worktree-kit.local.yml lookup
+  cfg_var "$1"; _d="${2:-}"
+  eval "printf '%s\n' \"\${WT_LCFG_$CV-\$_d}\""
+}
 
 expand() {
   printf '%s' "$1" | sed \
@@ -411,11 +541,13 @@ cmd_doctor() {
   echo "wt $WT_VERSION"
   echo "primary:   $PRIMARY"
   echo "worktree:  $WT_PATH (slug: $SLUG, n: $N)"
-  if [ -f "$CONFIG" ]; then require_config; echo "config:    $CONFIG (runner: $RUNNER)"; else echo "config:    MISSING — run wt init"; fi
+  if [ -f "$CONFIG" ]; then require_config; echo "config:    $CONFIG (runner: $RUNNER, cache: $WT_CFG_SRC)"; else echo "config:    MISSING — run wt init"; fi
+  yaml_backend
   case "$YAML_BACKEND" in
     yq)     echo "yaml:      $(yq --version)" ;;
     ruby)   echo "yaml:      ruby $(ruby -e 'print RUBY_VERSION') (yq not needed)" ;;
     python) echo "yaml:      python3 + PyYAML (yq not needed)" ;;
+    '')     echo "yaml:      NONE — ok while the config cache is fresh; config edits need yq, ruby, or python3+PyYAML" ;;
   esac
   [ "${RUNNER:-compose}" = compose ] && { docker info >/dev/null 2>&1 && echo "docker:    up" || echo "docker:    DOWN"; }
   if [ -d "$OVERLAY_DIR" ]; then

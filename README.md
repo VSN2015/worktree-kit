@@ -70,7 +70,10 @@ musl/Alpine). There are usually no dependencies to install: it reads its
 YAML config with whichever of yq, ruby, or python3 + PyYAML is already on
 your PATH (macOS ships ruby; `wt doctor` shows which one is in use), and
 checks ports with lsof, ss, or a ruby/python bind probe — whichever exists.
-Compose repos additionally need docker.
+The YAML reader only runs when the config changes — wt caches the parsed
+config under `.git/wt-state/` and sources it, so everyday commands start
+in milliseconds with no interpreter spawns. Compose repos additionally
+need docker.
 
 ## Per-repo setup
 

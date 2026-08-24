@@ -30,7 +30,10 @@ isolation:
     TEST_DATABASE: "wt_{slug}_test"
 EOF
 
-wt doctor | grep 'yaml:.*python3'
+wt doctor | grep 'yaml:.*python3'   # this first read also builds the config cache
+wt doctor | grep -q 'cache: hit'
+echo '# edited' >> worktree-kit.yml
+wt doctor | grep -q 'cache: rebuilt'
 wt run --isolated -- env | grep -E '^(REDIS_URL|TEST_DATABASE)=' | sort
 
 # server lifecycle: python bind probe for the port check (no real lsof/ss/ruby;
