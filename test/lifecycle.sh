@@ -77,5 +77,14 @@ assert_missing  "$out" "spare"          "list: plain list omits branchless branc
 # existing commands must still refuse to run without a config
 assert_fails "run still requires config" "$WT" run -- true
 
+# load_config_soft must never require docker: a compose config (the
+# default runner when `runner:` is omitted) must not stop `wt list` from
+# working when docker isn't even on PATH — only the ten pre-existing
+# commands (via require_config) may demand it.
+new_repo nodockerrepo
+printf 'hooks:\n  server: "true"\n' > worktree-kit.yml
+out="$(PATH=/usr/bin:/bin "$WT" list)"
+assert_contains "$out" master "list: works with a compose config and no docker on PATH"
+
 [ "$FAILED" = 0 ] || { echo "LIFECYCLE FAIL" >&2; exit 1; }
 echo "LIFECYCLE PASS"

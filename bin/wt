@@ -61,7 +61,6 @@ load_config_soft() {
     PREPARE="$(cfg_get hooks.prepare "")"
     BUILD="$(cfg_get hooks.build "")"
     SERVER_CMD="$(cfg_get hooks.server "")"
-    if [ "$RUNNER" = compose ]; then need docker; fi
   else
     HAS_CONFIG=0
     RUNNER=""; SERVICE=""; WORKDIR=""; CONTAINER_PORT=3000
@@ -74,6 +73,7 @@ require_config() {
   if [ "$HAS_CONFIG" = 0 ]; then
     die "no worktree-kit.yml at $PRIMARY — run 'wt init' in that repo"
   fi
+  if [ "$RUNNER" = compose ]; then need docker; fi
 }
 
 # ---------- yaml backend ----------
