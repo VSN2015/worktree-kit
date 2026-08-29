@@ -325,6 +325,7 @@ new_repo mergerepo
 wtdir="$TMP/mergerepo-worktrees/feat_work"
 ( cd "$wtdir" && echo one > one.txt && git add one.txt && git commit -qm "add one" )
 ( cd "$wtdir" && echo two > two.txt && git add two.txt && git commit -qm "add two" )
+pre_merge_head="$(git -C "$wtdir" rev-parse HEAD)"
 
 before="$(git -C "$REPO" rev-parse master)"
 "$WT" merge feat/work >/dev/null 2>&1
@@ -342,8 +343,14 @@ assert_contains "$(git -C "$REPO" log -1 --format=%s)" "add one" \
 assert_contains "$(git -C "$REPO" log -1 --format=%B)" "add two" \
   "merge: remaining subjects form the body"
 assert_eq "1" "$(test -d "$wtdir" && echo 0 || echo 1)" "merge: worktree removed by default"
-assert_contains "$(git -C "$REPO" show-ref)" "refs/wt/premerge/feat_work" \
-  "merge: backup ref kept as the undo"
+# Proves both the ref's name AND its value/timing: the squash's parent is
+# the merge-base (the repo's init commit), not "add one" — so a backup
+# written after the squash (instead of before) would point at a commit
+# with a different parent than pre_merge_head, and this would catch it
+# regardless of any commit-timestamp coincidence.
+backup_head="$(git -C "$REPO" rev-parse --verify --quiet refs/wt/premerge/feat_work 2>/dev/null || echo MISSING)"
+assert_eq "$pre_merge_head" "$backup_head" \
+  "merge: backup ref captures the branch's pre-squash HEAD, written before the rewrite"
 
 # --no-remove leaves the worktree in place
 "$WT" new feat/stay >/dev/null 2>&1
@@ -353,10 +360,23 @@ assert_eq "0" "$(test -d "$TMP/mergerepo-worktrees/feat_stay" && echo 0 || echo 
   "merge --no-remove: worktree survives"
 
 # a conflicting rebase restores the branch exactly and leaves the worktree alone
+#
+# feat/conflict gets TWO commits (not one) deliberately: squashing a
+# single-commit branch can produce a commit identical in every field but
+# timestamp to the original, and if both land in the same wall-clock
+# second, the squash commit hashes IDENTICALLY to $orig — so a bare
+# "rebase --abort" (no explicit restore at all) would coincidentally leave
+# HEAD at a SHA equal to $orig, and the SHA-equality assertion below would
+# pass even with the restore code deleted. Two commits make the squash
+# collapse two parents into one, which changes the history SHAPE
+# (2 commits -> 1) regardless of any timestamp coincidence, so the
+# rev-list --count assertion cannot pass by accident.
 new_repo conflictrepo
 echo base > f.txt && git add f.txt && git commit -qm base
+base="$(git -C "$REPO" rev-parse HEAD)"
 "$WT" new feat/conflict >/dev/null 2>&1
 cdir="$TMP/conflictrepo-worktrees/feat_conflict"
+( cd "$cdir" && echo mid > mid.txt && git add mid.txt && git commit -qm mid )
 ( cd "$cdir" && echo theirs > f.txt && git add f.txt && git commit -qm theirs )
 orig="$(git -C "$cdir" rev-parse HEAD)"
 echo ours > f.txt && git add f.txt && git commit -qm ours
@@ -365,6 +385,8 @@ master_before="$(git -C "$REPO" rev-parse master)"
 assert_fails "merge: conflict is an error" "$WT" merge feat/conflict
 assert_eq "$orig" "$(git -C "$cdir" rev-parse HEAD)" \
   "merge: branch restored to its pre-squash commit after a conflict"
+assert_eq "2" "$(git -C "$cdir" rev-list --count "$base..HEAD")" \
+  "merge: pre-squash history restored, not just aborted"
 assert_eq "$master_before" "$(git -C "$REPO" rev-parse master)" \
   "merge: master untouched after a conflict"
 assert_eq "0" "$(test -d "$cdir" && echo 0 || echo 1)" "merge: worktree survives a conflict"
@@ -386,6 +408,62 @@ assert_fails "merge: refuses a dirty worktree" "$WT" merge feat/dirty
 echo primarydirt > "$REPO/dirt.txt"
 assert_fails "merge: refuses when the primary checkout is dirty" "$WT" merge feat/ok
 rm -f "$REPO/dirt.txt"
+
+# trunk not checked out at the primary. assert_fails alone is not enough
+# here: without this guard, "wt merge feat/tc" would ff-only-merge into
+# whatever IS checked out ("other") instead of refusing, and since "other"
+# happens to be fully mergeable it exits 0 having done real damage — so
+# what actually proves the guard fired is that master (the real trunk)
+# never moved, not just a nonzero exit.
+new_repo trunkcheckoutrepo
+"$WT" new feat/tc >/dev/null 2>&1
+( cd "$TMP/trunkcheckoutrepo-worktrees/feat_tc" && echo t > t.txt && git add t.txt && git commit -qm t )
+git -C "$REPO" checkout -qb other
+master_before_tc="$(git -C "$REPO" rev-parse master)"
+assert_fails "merge: refuses when trunk is not checked out at the primary" "$WT" merge feat/tc
+assert_eq "0" "$(test -d "$TMP/trunkcheckoutrepo-worktrees/feat_tc" && echo 0 || echo 1)" \
+  "merge: refused-trunk-checkout worktree survives"
+assert_eq "$master_before_tc" "$(git -C "$REPO" rev-parse master)" \
+  "merge: refused-trunk-checkout master untouched — the guard fires before any rewrite"
+
+# a branch with an upstream is refused unless --force (squashing would
+# rewrite already-published history) — this is --force's only consumer
+# in wt merge, so exercise both the refusal and the override.
+#
+# assert_fails alone is not enough here either: without this guard, the
+# squash/rebase/ff-only-merge all still succeed (master DOES advance), and
+# the command only fails at the very end, when "git branch -d" hits ITS
+# OWN unrelated safety check (a branch not merged to its upstream) — an
+# entirely different, incidental refusal that fires only after the
+# destructive rewrite already happened. The real proof our guard (not
+# git's) is what's stopping this is that master and the branch never move.
+new_repo upstreamrepo
+remote_bare="$TMP/upstream-bare.git"
+git init -q --bare "$remote_bare"
+"$WT" new feat/pushed >/dev/null 2>&1
+pdir="$TMP/upstreamrepo-worktrees/feat_pushed"
+( cd "$pdir" && echo p > p.txt && git add p.txt && git commit -qm p )
+git -C "$pdir" remote add origin "$remote_bare"
+git -C "$pdir" push -q origin feat/pushed
+git -C "$pdir" branch -q --set-upstream-to=origin/feat/pushed feat/pushed
+pushed_head="$(git -C "$pdir" rev-parse HEAD)"
+master_before_upstream="$(git -C "$REPO" rev-parse master)"
+
+assert_fails "merge: refuses a branch with an upstream without --force" "$WT" merge feat/pushed
+assert_eq "0" "$(test -d "$pdir" && echo 0 || echo 1)" \
+  "merge: refused-upstream worktree survives"
+assert_eq "$master_before_upstream" "$(git -C "$REPO" rev-parse master)" \
+  "merge: refused-upstream master untouched — the guard fires before any rewrite"
+assert_eq "$pushed_head" "$(git -C "$pdir" rev-parse HEAD)" \
+  "merge: refused-upstream branch untouched — the guard fires before any rewrite"
+
+upstream_before="$(git -C "$REPO" rev-parse master)"
+"$WT" merge feat/pushed --force >/dev/null 2>&1
+if [ "$upstream_before" = "$(git -C "$REPO" rev-parse master)" ]; then
+  fail "merge --force: overrides the upstream guard and merges anyway"
+else
+  ok "merge --force: overrides the upstream guard and merges anyway"
+fi
 
 # wt merge from inside the worktree being merged must survive the cwd being
 # yanked out from under it (git worktree remove deletes the cwd, then

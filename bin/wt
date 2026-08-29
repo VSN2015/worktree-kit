@@ -1013,6 +1013,13 @@ cmd_merge() {
   if [ -n "$(git -C "$_path" status --porcelain)" ]; then
     die "$_branch has uncommitted changes — commit or stash them first"
   fi
+  # A configured worktrees.trunk (or --into) is unverified — it can name a
+  # ref this worktree cannot resolve (e.g. a remote-only branch). "cannot
+  # check" must never be treated as "nothing to merge" — mirrors cmd_rm's
+  # identical guard on the same conflation.
+  if ! git -C "$_path" rev-parse --verify --quiet "$_trunk" >/dev/null 2>&1; then
+    die "cannot verify commits ahead of $_trunk — $_trunk not found in this worktree; pass --into <branch> or set worktrees.trunk"
+  fi
   _ahead="$(git -C "$_path" rev-list --count "$_trunk..$_branch" 2>/dev/null || echo 0)"
   if [ "$_ahead" -eq 0 ]; then die "$_branch has no commits ahead of $_trunk"; fi
 
@@ -1051,23 +1058,35 @@ $_body"
   fi
   git -C "$_path" reset --soft "$_base" >&2
   if ! git -C "$_path" commit -q -m "$_msg" >&2; then
-    git -C "$_path" reset --hard "$_orig" >&2
-    die "squash commit failed — $_branch restored to $_orig"
+    git -C "$_path" reset --hard "$_orig" >&2 \
+      || note "could not restore the worktree — recover by hand: git -C $_path reset --hard $_backup"
+    die "squash commit failed — $_branch restored to $_orig (backup: $_backup)"
   fi
 
   # ---- rebase ----
   if ! git -C "$_path" rebase "$_trunk" >&2; then
-    git -C "$_path" rebase --abort >/dev/null 2>&1 || true
-    git -C "$_path" reset --hard "$_orig" >&2
-    die "rebase of $_branch onto $_trunk hit a conflict — $_branch restored to $_orig
+    # A mid-rebase HEAD is detached — refs/heads/$_branch still points at
+    # the squash commit until the rebase completes, so a bare "rebase
+    # --abort" is not enough to trust: if it fails, fall back to forcing
+    # the branch checked out, then move the branch ref itself back to
+    # $_orig explicitly rather than relying on whatever state the abort
+    # left behind. Only then reset the working tree/index to match — this
+    # guarantees the branch, not just some detached HEAD, ends up restored.
+    git -C "$_path" rebase --abort >/dev/null 2>&1 \
+      || git -C "$_path" checkout -f "$_branch" >/dev/null 2>&1 || true
+    git -C "$_path" update-ref "refs/heads/$_branch" "$_orig"
+    git -C "$_path" reset --hard "$_orig" >&2 \
+      || note "could not restore the worktree — recover by hand: git -C $_path reset --hard $_backup"
+    die "rebase of $_branch onto $_trunk hit a conflict — $_branch restored to $_orig (backup: $_backup)
 resolve by hand:  git -C $_path rebase $_trunk"
   fi
 
   # ---- fast-forward trunk ----
   _trunk_before="$(git -C "$PRIMARY" rev-parse "$_trunk")"
   if ! git -C "$PRIMARY" merge --ff-only "$_branch" >&2; then
-    git -C "$_path" reset --hard "$_orig" >&2
-    die "$_trunk could not fast-forward to $_branch — it moved underneath us; $_branch restored to $_orig"
+    git -C "$_path" reset --hard "$_orig" >&2 \
+      || note "could not restore the worktree — recover by hand: git -C $_path reset --hard $_backup"
+    die "$_trunk could not fast-forward to $_branch — it moved underneath us; $_branch restored to $_orig (backup: $_backup)"
   fi
   note "merged $_branch into $_trunk"
   note "undo:   git -C $PRIMARY reset --hard $_trunk_before   (branch backup: $_backup)"
