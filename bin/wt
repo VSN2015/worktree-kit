@@ -762,7 +762,7 @@ cmd_localize() {
 
 cmd_reset() {
   s="${1:-$SLUG}"
-  rm -f "$STATE_DIR/$s.dbready"
+  rm -f "$STATE_DIR/$s.dbready" "$STATE_DIR/$s.dbowned"
   note "cleared db-bootstrap marker for $s (next own-db run re-bootstraps)"
 }
 

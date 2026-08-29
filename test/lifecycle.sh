@@ -300,5 +300,23 @@ err="$(PATH=/usr/bin:/bin "$WT" rm feat/failstop --force 2>&1 >/dev/null)"
 assert_contains "$err" "could not stop the server" \
   "rm: a failed server-stop is reported, not swallowed"
 
+# ---------- Task 4 fix round 2 ----------
+
+# wt reset must clear both provenance markers together. A stale .dbowned
+# surviving a reset would let a later, merely-adopted database (db_check
+# touches only .dbready) inherit an ownership claim it never earned — the
+# exact guarantee round 1's item 5 established for wt rm (and, imminently,
+# wt merge, which does not prompt).
+new_repo resetrepo
+rstate="$REPO/.git/wt-state"
+mkdir -p "$rstate"
+: > "$rstate/someslug.dbready"
+: > "$rstate/someslug.dbowned"
+"$WT" reset someslug >/dev/null 2>&1
+assert_eq "1" "$(test -f "$rstate/someslug.dbready" && echo 0 || echo 1)" \
+  "reset: clears the dbready marker"
+assert_eq "1" "$(test -f "$rstate/someslug.dbowned" && echo 0 || echo 1)" \
+  "reset: clears the dbowned marker too"
+
 [ "$FAILED" = 0 ] || { echo "LIFECYCLE FAIL" >&2; exit 1; }
 echo "LIFECYCLE PASS"
