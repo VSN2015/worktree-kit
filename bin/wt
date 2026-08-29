@@ -50,17 +50,30 @@ ctx_init() {
   mkdir -p "$STATE_DIR/logs"
 }
 
+load_config_soft() {
+  if [ -f "$CONFIG" ]; then
+    HAS_CONFIG=1
+    load_config
+    RUNNER="$(cfg_get runner compose)"
+    SERVICE="$(cfg_get compose.service app)"
+    WORKDIR="$(cfg_get compose.workdir /app)"
+    CONTAINER_PORT="$(cfg_get hooks.container_port 3000)"
+    PREPARE="$(cfg_get hooks.prepare "")"
+    BUILD="$(cfg_get hooks.build "")"
+    SERVER_CMD="$(cfg_get hooks.server "")"
+    if [ "$RUNNER" = compose ]; then need docker; fi
+  else
+    HAS_CONFIG=0
+    RUNNER=""; SERVICE=""; WORKDIR=""; CONTAINER_PORT=3000
+    PREPARE=""; BUILD=""; SERVER_CMD=""
+  fi
+}
+
 require_config() {
-  [ -f "$CONFIG" ] || die "no worktree-kit.yml at $PRIMARY — run 'wt init' in that repo"
-  load_config
-  RUNNER="$(cfg_get runner compose)"
-  SERVICE="$(cfg_get compose.service app)"
-  WORKDIR="$(cfg_get compose.workdir /app)"
-  CONTAINER_PORT="$(cfg_get hooks.container_port 3000)"
-  PREPARE="$(cfg_get hooks.prepare "")"
-  BUILD="$(cfg_get hooks.build "")"
-  SERVER_CMD="$(cfg_get hooks.server "")"
-  if [ "$RUNNER" = compose ]; then need docker; fi
+  load_config_soft
+  if [ "$HAS_CONFIG" = 0 ]; then
+    die "no worktree-kit.yml at $PRIMARY — run 'wt init' in that repo"
+  fi
 }
 
 # ---------- yaml backend ----------
@@ -264,6 +277,77 @@ expand() {
 }
 
 worktree_paths() { git worktree list --porcelain | awk '/^worktree /{print $2}'; }
+
+# ---------- lifecycle ----------
+
+TAB="$(printf '\t')"
+
+resolve_trunk() { # prints the trunk branch name, or empty
+  _t=""
+  if [ "${HAS_CONFIG:-0}" = 1 ]; then
+    _t="$(local_get worktrees.trunk "")"
+    if [ -z "$_t" ]; then _t="$(cfg_get worktrees.trunk "")"; fi
+  fi
+  if [ -z "$_t" ]; then
+    _t="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')" || _t=""
+  fi
+  if [ -z "$_t" ]; then
+    if git show-ref --verify --quiet refs/heads/main; then
+      _t=main
+    elif git show-ref --verify --quiet refs/heads/master; then
+      _t=master
+    fi
+  fi
+  printf '%s\n' "$_t"
+}
+
+worktree_for_branch() { # <branch> -> path, or empty. Always exits 0.
+  git worktree list --porcelain | awk -v b="refs/heads/$1" '
+    /^worktree /{ p = $2 }
+    $1 == "branch" && $2 == b { print p; exit }
+  '
+  true
+}
+
+# One TAB-separated row per worktree: branch, slug, status, server, iso, path.
+# wt list and the picker both read this, so they cannot drift.
+worktree_rows() {
+  _trunk="$(resolve_trunk)"
+  git worktree list --porcelain | awk '
+    /^worktree /  { p = $2 }
+    /^branch /    { b = $2; sub("refs/heads/", "", b); print p "\t" b }
+    /^detached/   { print p "\t(detached)" }
+  ' | while IFS="$TAB" read -r _p _b; do
+    _s="$(slugify "$_p")"
+
+    _st=clean
+    if [ -n "$(git -C "$_p" status --porcelain 2>/dev/null)" ]; then _st=dirty; fi
+    if [ -n "$_trunk" ] && git -C "$_p" rev-parse --verify --quiet "$_trunk" >/dev/null 2>&1; then
+      _c="$(git -C "$_p" rev-list --left-right --count "$_trunk...HEAD" 2>/dev/null || printf '0\t0')"
+      _behind="$(printf '%s' "$_c" | cut -f1)"
+      _ahead="$(printf '%s' "$_c" | cut -f2)"
+      if [ "${_ahead:-0}"  -gt 0 ]; then _st="$_st +$_ahead"; fi
+      if [ "${_behind:-0}" -gt 0 ]; then _st="$_st -$_behind"; fi
+    fi
+
+    _srv="-"; _iso="-"
+    if [ "${HAS_CONFIG:-0}" = 1 ]; then
+      if [ "$RUNNER" = compose ]; then
+        _srv="$(docker ps --filter "label=wt.project=$PROJECT" --filter "label=wt.slug=$_s" \
+                  --format '{{.Label "wt.port"}}' 2>/dev/null | head -1)"
+        _iso="$(docker ps --filter "label=wt.project=$PROJECT" --filter "label=wt.slug=$_s" \
+                  --format '{{.Label "wt.isolation"}}' 2>/dev/null | head -1)"
+      elif [ -f "$STATE_DIR/$_s.pid" ]; then
+        _srv="$(cat "$STATE_DIR/$_s.port" 2>/dev/null || echo '?')"
+      fi
+    fi
+    if [ -n "$_srv" ] && [ "$_srv" != "-" ]; then _srv=":$_srv"; else _srv="-"; fi
+    if [ -z "$_iso" ]; then _iso="-"; fi
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$_b" "$_s" "$_st" "$_srv" "$_iso" "$_p"
+  done
+  true
+}
 
 # ---------- ports ----------
 
@@ -589,6 +673,35 @@ cmd_doctor() {
   echo "ok"
 }
 
+cmd_list() {
+  load_config_soft
+  _all=0
+  for _a in "$@"; do
+    case "$_a" in
+      --all) _all=1 ;;
+      *)     die "unknown flag: $_a (wt list [--all])" ;;
+    esac
+  done
+
+  _out="BRANCH${TAB}SLUG${TAB}STATUS${TAB}SERVER${TAB}ISO${TAB}PATH
+$(worktree_rows)"
+
+  if [ "$_all" = 1 ]; then
+    for _b in $(git for-each-ref --format='%(refname:short)' refs/heads); do
+      if [ -z "$(worktree_for_branch "$_b")" ]; then
+        _out="$_out
+$_b${TAB}-${TAB}(no worktree)${TAB}-${TAB}-${TAB}-"
+      fi
+    done
+  fi
+
+  if command -v column >/dev/null 2>&1; then
+    printf '%s\n' "$_out" | column -t -s "$TAB"
+  else
+    printf '%s\n' "$_out"
+  fi
+}
+
 usage() {
   cat <<'EOF'
 wt — worktree-aware runner (config: worktree-kit.yml at the primary checkout)
@@ -601,6 +714,7 @@ wt — worktree-aware runner (config: worktree-kit.yml at the primary checkout)
   wt logs [slug]         follow a server's logs
   wt localize <file...>  snapshot a personal overlay (--list / --remove)
   wt reset [slug]        clear the own-db bootstrap marker
+  wt list [--all]        list worktrees (branch, slug, status, server, isolation)
   wt init                write worktree-kit.yml from a stack template
   wt doctor              environment + config checks
 EOF
@@ -622,6 +736,7 @@ case "$1" in
   logs) shift; cmd_logs "$@" ;;
   localize) shift; cmd_localize "$@" ;;
   reset) shift; cmd_reset "$@" ;;
+  list) shift; cmd_list "$@" ;;
   init) shift; cmd_init "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
   *) die "unknown command: $1 (wt --help)" ;;

@@ -75,4 +75,7 @@ cd /tmp/app && wt down
 wt ps | grep -q running && exit 1 || true
 # down must kill the real server, not just the sh -c wrapper
 curl -fsS -m 2 http://localhost:4321/ >/dev/null 2>&1 && exit 1 || echo "port freed — no orphan"
+
+# lifecycle commands: git only, no docker, no YAML backend
+sh /src/test/lifecycle.sh
 echo "DEBIAN PASS"
