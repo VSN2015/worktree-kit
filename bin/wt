@@ -986,6 +986,108 @@ cmd_rm() {
   if [ "$_removed_cwd" = 1 ]; then emit_cd "$PRIMARY"; fi
 }
 
+cmd_merge() {
+  load_config_soft
+  _trunk=""; _msg=""; _no_remove=0; _force=0; _branch=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --into)      _trunk="${2:-}"; [ -n "$_trunk" ] || die "--into needs a branch"; shift 2 ;;
+      -m)          _msg="${2:-}";   [ -n "$_msg" ]   || die "-m needs a message";   shift 2 ;;
+      --no-remove) _no_remove=1; shift ;;
+      -f|--force)  _force=1; shift ;;
+      -*)          die "unknown flag: $1 (wt merge [<branch>] [--into <trunk>] [--no-remove] [-m <msg>] [--force])" ;;
+      *)           _branch="$1"; shift ;;
+    esac
+  done
+  if [ -z "$_branch" ]; then _branch="$(git rev-parse --abbrev-ref HEAD)"; fi
+
+  _path="$(worktree_for_branch "$_branch")"
+  if [ -z "$_path" ]; then die "no worktree for branch $_branch (see: wt list)"; fi
+  if [ "$_path" = "$PRIMARY" ]; then die "refusing to merge the primary checkout's own branch"; fi
+
+  if [ -z "$_trunk" ]; then _trunk="$(resolve_trunk)"; fi
+  if [ -z "$_trunk" ]; then die "cannot determine trunk — pass --into <branch> or set worktrees.trunk"; fi
+  if [ "$_trunk" = "$_branch" ]; then die "$_branch is the trunk"; fi
+
+  # ---- guards, before anything is rewritten ----
+  if [ -n "$(git -C "$_path" status --porcelain)" ]; then
+    die "$_branch has uncommitted changes — commit or stash them first"
+  fi
+  _ahead="$(git -C "$_path" rev-list --count "$_trunk..$_branch" 2>/dev/null || echo 0)"
+  if [ "$_ahead" -eq 0 ]; then die "$_branch has no commits ahead of $_trunk"; fi
+
+  _primary_branch="$(git -C "$PRIMARY" rev-parse --abbrev-ref HEAD)"
+  if [ "$_primary_branch" != "$_trunk" ]; then
+    die "$_trunk is not checked out at $PRIMARY (found $_primary_branch)"
+  fi
+  if [ -n "$(git -C "$PRIMARY" status --porcelain)" ]; then
+    die "the primary checkout at $PRIMARY is dirty — commit or stash first"
+  fi
+  if git -C "$_path" rev-parse --verify --quiet "$_branch@{upstream}" >/dev/null 2>&1; then
+    if [ "$_force" = 0 ]; then
+      die "$_branch has an upstream — squashing rewrites published history; pass --force to proceed"
+    fi
+  fi
+
+  # ---- backup ref: the undo for everything below ----
+  _slug="$(slugify "$_path")"
+  _backup="refs/wt/premerge/$_slug"
+  _orig="$(git -C "$_path" rev-parse HEAD)"
+  git -C "$_path" update-ref "$_backup" "$_orig"
+  note "backup: $_backup -> $_orig"
+
+  # ---- squash ----
+  _base="$(git -C "$_path" merge-base "$_trunk" "$_branch")"
+  if [ -z "$_msg" ]; then
+    _subj="$(git -C "$_path" log --format='%s' --reverse "$_base..$_branch" | head -1)"
+    _body="$(git -C "$_path" log --format='%s' --reverse "$_base..$_branch" | tail -n +2)"
+    if [ -n "$_body" ]; then
+      _msg="$_subj
+
+$_body"
+    else
+      _msg="$_subj"
+    fi
+  fi
+  git -C "$_path" reset --soft "$_base" >&2
+  if ! git -C "$_path" commit -q -m "$_msg" >&2; then
+    git -C "$_path" reset --hard "$_orig" >&2
+    die "squash commit failed — $_branch restored to $_orig"
+  fi
+
+  # ---- rebase ----
+  if ! git -C "$_path" rebase "$_trunk" >&2; then
+    git -C "$_path" rebase --abort >/dev/null 2>&1 || true
+    git -C "$_path" reset --hard "$_orig" >&2
+    die "rebase of $_branch onto $_trunk hit a conflict — $_branch restored to $_orig
+resolve by hand:  git -C $_path rebase $_trunk"
+  fi
+
+  # ---- fast-forward trunk ----
+  _trunk_before="$(git -C "$PRIMARY" rev-parse "$_trunk")"
+  if ! git -C "$PRIMARY" merge --ff-only "$_branch" >&2; then
+    git -C "$_path" reset --hard "$_orig" >&2
+    die "$_trunk could not fast-forward to $_branch — it moved underneath us; $_branch restored to $_orig"
+  fi
+  note "merged $_branch into $_trunk"
+  note "undo:   git -C $PRIMARY reset --hard $_trunk_before   (branch backup: $_backup)"
+
+  # ---- teardown ----
+  if [ "$_no_remove" = 1 ]; then return 0; fi
+
+  _removed_cwd=0
+  # git worktree remove deletes the cwd out from under this process when we
+  # are inside it; the very next git call (branch -d/-D) then fails calling
+  # getcwd() ("Unable to read current working directory") and set -e kills
+  # cmd_merge before the branch is deleted or emit_cd runs. Step out first.
+  # runner_exec keys off $WT_PATH (a fixed global), not the live cwd, so
+  # this does not retarget teardown_worktree's own_db/redis work.
+  if [ "$WT_PATH" = "$_path" ]; then _removed_cwd=1; cd "$PRIMARY"; fi
+  teardown_worktree "$_slug" "$_path"
+  remove_worktree_and_branch "$_branch" "$_path" 0 0
+  if [ "$_removed_cwd" = 1 ]; then emit_cd "$PRIMARY"; fi
+}
+
 cmd_shell_init() {
   _kind="${1:-}"
   if [ -z "$_kind" ]; then _kind="$(basename "${SHELL:-sh}")"; fi
@@ -1040,6 +1142,8 @@ wt — worktree-aware runner (config: worktree-kit.yml at the primary checkout)
   wt new <branch> [--from <base>] [--server]   create a branch + worktree
   wt switch [<branch>]   cd to a worktree; no argument opens a picker
   wt rm [<branch>] [--keep-branch] [--force]   tear down and remove a worktree
+  wt merge [<branch>] [--into <trunk>] [-m <msg>] [--no-remove] [--force]
+                         squash, rebase, fast-forward trunk, then tear down
   wt list [--all]        list worktrees (branch, slug, status, server, isolation)
   wt init                write worktree-kit.yml from a stack template
   wt doctor              environment + config checks
@@ -1067,6 +1171,7 @@ case "$1" in
   new) shift; cmd_new "$@" ;;
   switch) shift; cmd_switch "$@" ;;
   rm) shift; cmd_rm "$@" ;;
+  merge) shift; cmd_merge "$@" ;;
   list) shift; cmd_list "$@" ;;
   init) shift; cmd_init "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;

@@ -318,5 +318,86 @@ assert_eq "1" "$(test -f "$rstate/someslug.dbready" && echo 0 || echo 1)" \
 assert_eq "1" "$(test -f "$rstate/someslug.dbowned" && echo 0 || echo 1)" \
   "reset: clears the dbowned marker too"
 
+# ---------- Task 5: merge ----------
+
+new_repo mergerepo
+"$WT" new feat/work >/dev/null 2>&1
+wtdir="$TMP/mergerepo-worktrees/feat_work"
+( cd "$wtdir" && echo one > one.txt && git add one.txt && git commit -qm "add one" )
+( cd "$wtdir" && echo two > two.txt && git add two.txt && git commit -qm "add two" )
+
+before="$(git -C "$REPO" rev-parse master)"
+"$WT" merge feat/work >/dev/null 2>&1
+after="$(git -C "$REPO" rev-parse master)"
+
+# assert_eq "1" "$(test A = B; echo $?)" dies inside the substitution under
+# set -eu whenever the test succeeds (before==after), i.e. exactly when the
+# merge failed to advance master — so it could only ever fail for the right
+# reason and never confirm success. Express the intent directly instead.
+if [ "$before" = "$after" ]; then fail "merge: master advanced"; else ok "merge: master advanced"; fi
+assert_eq "1" "$(git -C "$REPO" rev-list --count "$before..$after")" \
+  "merge: two commits squashed into one"
+assert_contains "$(git -C "$REPO" log -1 --format=%s)" "add one" \
+  "merge: subject taken from the first commit"
+assert_contains "$(git -C "$REPO" log -1 --format=%B)" "add two" \
+  "merge: remaining subjects form the body"
+assert_eq "1" "$(test -d "$wtdir" && echo 0 || echo 1)" "merge: worktree removed by default"
+assert_contains "$(git -C "$REPO" show-ref)" "refs/wt/premerge/feat_work" \
+  "merge: backup ref kept as the undo"
+
+# --no-remove leaves the worktree in place
+"$WT" new feat/stay >/dev/null 2>&1
+( cd "$TMP/mergerepo-worktrees/feat_stay" && echo s > s.txt && git add s.txt && git commit -qm stay )
+"$WT" merge feat/stay --no-remove >/dev/null 2>&1
+assert_eq "0" "$(test -d "$TMP/mergerepo-worktrees/feat_stay" && echo 0 || echo 1)" \
+  "merge --no-remove: worktree survives"
+
+# a conflicting rebase restores the branch exactly and leaves the worktree alone
+new_repo conflictrepo
+echo base > f.txt && git add f.txt && git commit -qm base
+"$WT" new feat/conflict >/dev/null 2>&1
+cdir="$TMP/conflictrepo-worktrees/feat_conflict"
+( cd "$cdir" && echo theirs > f.txt && git add f.txt && git commit -qm theirs )
+orig="$(git -C "$cdir" rev-parse HEAD)"
+echo ours > f.txt && git add f.txt && git commit -qm ours
+master_before="$(git -C "$REPO" rev-parse master)"
+
+assert_fails "merge: conflict is an error" "$WT" merge feat/conflict
+assert_eq "$orig" "$(git -C "$cdir" rev-parse HEAD)" \
+  "merge: branch restored to its pre-squash commit after a conflict"
+assert_eq "$master_before" "$(git -C "$REPO" rev-parse master)" \
+  "merge: master untouched after a conflict"
+assert_eq "0" "$(test -d "$cdir" && echo 0 || echo 1)" "merge: worktree survives a conflict"
+assert_eq "" "$(git -C "$cdir" status --porcelain)" \
+  "merge: no rebase left in progress"
+
+# guards
+new_repo guardrepo
+"$WT" new feat/empty >/dev/null 2>&1
+assert_fails "merge: refuses a branch with no commits ahead" "$WT" merge feat/empty
+
+"$WT" new feat/dirty >/dev/null 2>&1
+( cd "$TMP/guardrepo-worktrees/feat_dirty" && echo d > d.txt && git add d.txt \
+    && git commit -qm d && echo x > x.txt )
+assert_fails "merge: refuses a dirty worktree" "$WT" merge feat/dirty
+
+"$WT" new feat/ok >/dev/null 2>&1
+( cd "$TMP/guardrepo-worktrees/feat_ok" && echo o > o.txt && git add o.txt && git commit -qm o )
+echo primarydirt > "$REPO/dirt.txt"
+assert_fails "merge: refuses when the primary checkout is dirty" "$WT" merge feat/ok
+rm -f "$REPO/dirt.txt"
+
+# wt merge from inside the worktree being merged must survive the cwd being
+# yanked out from under it (git worktree remove deletes the cwd, then
+# git branch -d's getcwd() call dies) and still land the caller in the
+# primary via the cd channel — the same defect Task 4 fixed for wt rm.
+new_repo cwdrepo
+"$WT" new feat/incwd >/dev/null 2>&1
+wtdir_incwd="$TMP/cwdrepo-worktrees/feat_incwd"
+( cd "$wtdir_incwd" && echo w > w.txt && git add w.txt && git commit -qm w )
+cwdrepo_repo="$REPO"
+out="$( (cd "$wtdir_incwd" && "$WT" merge feat/incwd 2>/dev/null) || true )"
+assert_eq "$cwdrepo_repo" "$out" "merge: from inside the worktree, prints the primary for cd"
+
 [ "$FAILED" = 0 ] || { echo "LIFECYCLE FAIL" >&2; exit 1; }
 echo "LIFECYCLE PASS"
