@@ -1135,7 +1135,20 @@ resolve by hand:  git -C $_path rebase $_trunk"
   # this does not retarget teardown_worktree's own_db/redis work.
   if [ "$WT_PATH" = "$_path" ]; then _removed_cwd=1; cd "$PRIMARY"; fi
   teardown_worktree "$_slug" "$_path"
-  remove_worktree_and_branch "$_branch" "$_path" 0 0
+  # force=1 here (not 0): the --ff-only merge above already PROVED every
+  # commit on $_branch is reachable from $_trunk — that is what a
+  # fast-forward is — so plain "git branch -d"'s own "have I merged this?"
+  # safety check is redundant and can misfire: a branch with a (now stale)
+  # upstream tracking ref is merged to HEAD but not to that upstream, and
+  # -d refuses on that alone even though the invariant it exists to protect
+  # already holds. Do NOT harden this back to 0 — that would make `wt
+  # merge` on a pushed branch fail after $_trunk has already advanced and
+  # teardown has already run, the worst possible place to fail. This also
+  # makes the worktree removal itself --force (discards untracked files in
+  # $_path); that is accepted, not a bug to route around — we already
+  # refused earlier on a dirty worktree, and teardown can leave new files
+  # behind between that check and here.
+  remove_worktree_and_branch "$_branch" "$_path" 0 1
   if [ "$_removed_cwd" = 1 ]; then emit_cd "$PRIMARY"; fi
 }
 

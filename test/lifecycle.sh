@@ -321,14 +321,14 @@ assert_eq "1" "$(test -f "$rstate/someslug.dbowned" && echo 0 || echo 1)" \
 # ---------- Task 5: merge ----------
 
 new_repo mergerepo
-"$WT" new feat/work >/dev/null 2>&1
+"$WT" new feat/work >/dev/null 2>&1 || fail "merge: setup — wt new feat/work failed"
 wtdir="$TMP/mergerepo-worktrees/feat_work"
 ( cd "$wtdir" && echo one > one.txt && git add one.txt && git commit -qm "add one" )
 ( cd "$wtdir" && echo two > two.txt && git add two.txt && git commit -qm "add two" )
 pre_merge_head="$(git -C "$wtdir" rev-parse HEAD)"
 
 before="$(git -C "$REPO" rev-parse master)"
-"$WT" merge feat/work >/dev/null 2>&1
+"$WT" merge feat/work >/dev/null 2>&1 || fail "merge: feat/work merge failed"
 after="$(git -C "$REPO" rev-parse master)"
 
 # assert_eq "1" "$(test A = B; echo $?)" dies inside the substitution under
@@ -353,9 +353,9 @@ assert_eq "$pre_merge_head" "$backup_head" \
   "merge: backup ref captures the branch's pre-squash HEAD, written before the rewrite"
 
 # --no-remove leaves the worktree in place
-"$WT" new feat/stay >/dev/null 2>&1
+"$WT" new feat/stay >/dev/null 2>&1 || fail "merge --no-remove: setup — wt new feat/stay failed"
 ( cd "$TMP/mergerepo-worktrees/feat_stay" && echo s > s.txt && git add s.txt && git commit -qm stay )
-"$WT" merge feat/stay --no-remove >/dev/null 2>&1
+"$WT" merge feat/stay --no-remove >/dev/null 2>&1 || fail "merge --no-remove: merge failed"
 assert_eq "0" "$(test -d "$TMP/mergerepo-worktrees/feat_stay" && echo 0 || echo 1)" \
   "merge --no-remove: worktree survives"
 
@@ -374,7 +374,7 @@ assert_eq "0" "$(test -d "$TMP/mergerepo-worktrees/feat_stay" && echo 0 || echo 
 new_repo conflictrepo
 echo base > f.txt && git add f.txt && git commit -qm base
 base="$(git -C "$REPO" rev-parse HEAD)"
-"$WT" new feat/conflict >/dev/null 2>&1
+"$WT" new feat/conflict >/dev/null 2>&1 || fail "merge: setup — wt new feat/conflict failed"
 cdir="$TMP/conflictrepo-worktrees/feat_conflict"
 ( cd "$cdir" && echo mid > mid.txt && git add mid.txt && git commit -qm mid )
 ( cd "$cdir" && echo theirs > f.txt && git add f.txt && git commit -qm theirs )
@@ -395,15 +395,15 @@ assert_eq "" "$(git -C "$cdir" status --porcelain)" \
 
 # guards
 new_repo guardrepo
-"$WT" new feat/empty >/dev/null 2>&1
+"$WT" new feat/empty >/dev/null 2>&1 || fail "merge: setup — wt new feat/empty failed"
 assert_fails "merge: refuses a branch with no commits ahead" "$WT" merge feat/empty
 
-"$WT" new feat/dirty >/dev/null 2>&1
+"$WT" new feat/dirty >/dev/null 2>&1 || fail "merge: setup — wt new feat/dirty failed"
 ( cd "$TMP/guardrepo-worktrees/feat_dirty" && echo d > d.txt && git add d.txt \
     && git commit -qm d && echo x > x.txt )
 assert_fails "merge: refuses a dirty worktree" "$WT" merge feat/dirty
 
-"$WT" new feat/ok >/dev/null 2>&1
+"$WT" new feat/ok >/dev/null 2>&1 || fail "merge: setup — wt new feat/ok failed"
 ( cd "$TMP/guardrepo-worktrees/feat_ok" && echo o > o.txt && git add o.txt && git commit -qm o )
 echo primarydirt > "$REPO/dirt.txt"
 assert_fails "merge: refuses when the primary checkout is dirty" "$WT" merge feat/ok
@@ -416,7 +416,7 @@ rm -f "$REPO/dirt.txt"
 # what actually proves the guard fired is that master (the real trunk)
 # never moved, not just a nonzero exit.
 new_repo trunkcheckoutrepo
-"$WT" new feat/tc >/dev/null 2>&1
+"$WT" new feat/tc >/dev/null 2>&1 || fail "merge: setup — wt new feat/tc failed"
 ( cd "$TMP/trunkcheckoutrepo-worktrees/feat_tc" && echo t > t.txt && git add t.txt && git commit -qm t )
 git -C "$REPO" checkout -qb other
 master_before_tc="$(git -C "$REPO" rev-parse master)"
@@ -440,7 +440,7 @@ assert_eq "$master_before_tc" "$(git -C "$REPO" rev-parse master)" \
 new_repo upstreamrepo
 remote_bare="$TMP/upstream-bare.git"
 git init -q --bare "$remote_bare"
-"$WT" new feat/pushed >/dev/null 2>&1
+"$WT" new feat/pushed >/dev/null 2>&1 || fail "merge: setup — wt new feat/pushed failed"
 pdir="$TMP/upstreamrepo-worktrees/feat_pushed"
 ( cd "$pdir" && echo p > p.txt && git add p.txt && git commit -qm p )
 git -C "$pdir" remote add origin "$remote_bare"
@@ -458,7 +458,7 @@ assert_eq "$pushed_head" "$(git -C "$pdir" rev-parse HEAD)" \
   "merge: refused-upstream branch untouched — the guard fires before any rewrite"
 
 upstream_before="$(git -C "$REPO" rev-parse master)"
-"$WT" merge feat/pushed --force >/dev/null 2>&1
+"$WT" merge feat/pushed --force >/dev/null 2>&1 || fail "merge --force: merge failed"
 if [ "$upstream_before" = "$(git -C "$REPO" rev-parse master)" ]; then
   fail "merge --force: overrides the upstream guard and merges anyway"
 else
@@ -470,7 +470,7 @@ fi
 # git branch -d's getcwd() call dies) and still land the caller in the
 # primary via the cd channel — the same defect Task 4 fixed for wt rm.
 new_repo cwdrepo
-"$WT" new feat/incwd >/dev/null 2>&1
+"$WT" new feat/incwd >/dev/null 2>&1 || fail "merge: setup — wt new feat/incwd failed"
 wtdir_incwd="$TMP/cwdrepo-worktrees/feat_incwd"
 ( cd "$wtdir_incwd" && echo w > w.txt && git add w.txt && git commit -qm w )
 cwdrepo_repo="$REPO"
