@@ -363,18 +363,28 @@ path_template() {
   printf '%s\n' "$_t"
 }
 
+# Escapes a value used as sed REPLACEMENT text, where & means "the whole
+# match", \ starts an escape, and | is our delimiter. Unlike expand()'s
+# inputs (SLUG, N, PORT, PROJECT — all already sanitized to safe charsets),
+# expand_path substitutes raw filesystem and git names: a repo directory
+# called "R&D-app" expanded {repo} to "R{repo}D-app", and a branch with a |
+# in it (legal in a git ref) broke the sed expression outright.
+_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+
 # {branch_raw} MUST be substituted before {branch}, or the longer token is
 # eaten by the shorter one and leaves a stray "_raw".
 expand_path() { # <template> <raw-branch>
   _pb="$(sanitize_branch "$2")"
-  _pp="$(dirname "$PRIMARY")"
-  _pr="$(basename "$PRIMARY")"
+  _pp="$(_esc "$(dirname "$PRIMARY")")"
+  _pr="$(_esc "$(basename "$PRIMARY")")"
+  _praw="$(_esc "$2")"
+  _phome="$(_esc "${HOME:-}")"
   printf '%s' "$1" | sed \
-    -e "s|{branch_raw}|$2|g" \
+    -e "s|{branch_raw}|$_praw|g" \
     -e "s|{parent}|$_pp|g" \
     -e "s|{repo}|$_pr|g" \
     -e "s|{branch}|$_pb|g" \
-    -e "s|{home}|$HOME|g"
+    -e "s|{home}|$_phome|g"
 }
 
 # stdout is the cd channel: a path, and nothing else.
@@ -426,9 +436,17 @@ teardown_worktree() { # <slug> <path>
   if [ "${HAS_CONFIG:-0}" = 1 ]; then
     "$0" down "$_ts" >&2 || note "could not stop the server for $_ts — check for a stray process"
 
-    # expand() reads the globals SLUG and N; borrow them for the target slug
-    _old_slug="$SLUG"; _old_n="$N"
-    SLUG="$_ts"; N=$(( $(hashnum "$_ts") % 15 + 1 ))
+    # expand() reads the globals SLUG and N, and runner_exec reads WT_PATH
+    # (host: `cd "$WT_PATH"`; compose: `-v $WT_PATH:$WORKDIR`). Borrow all
+    # THREE for the target — borrowing only the first two left db_drop and
+    # redis_flush running against the CALLER's worktree, which re-ran that
+    # repo's hooks.prepare (bundle install, npm ci, ...) on every wt rm of
+    # another worktree and resolved relative paths in the wrong tree. Safe
+    # because teardown always runs before the directory is removed, and
+    # cmd_rm's process-level `cd "$PRIMARY"` is unaffected: runner_exec's
+    # host branch cds inside its own subshell.
+    _old_slug="$SLUG"; _old_n="$N"; _old_path="$WT_PATH"
+    SLUG="$_ts"; N=$(( $(hashnum "$_ts") % 15 + 1 )); WT_PATH="$_tp"
 
     if [ -f "$STATE_DIR/$_ts.dbready" ]; then
       if [ -f "$STATE_DIR/$_ts.dbowned" ]; then
@@ -440,7 +458,12 @@ teardown_worktree() { # <slug> <path>
           note "no isolation.db_drop configured — the database for slug $_ts is left in place"
         fi
       else
-        note "database for slug $_ts was adopted, not created by wt — leaving it in place"
+        # Two populations reach here and the notice must be true for both:
+        # a database db_check merely adopted, AND every database wt itself
+        # bootstrapped before 0.2.0, when .dbowned did not yet exist. Saying
+        # "adopted, not created by wt" is simply wrong for the second — and
+        # the second is what every upgrading user sees on their first wt rm.
+        note "no ownership marker for $_ts (databases bootstrapped before wt 0.2.0 have none) — leaving the database in place; drop it by hand if you want it gone"
       fi
     fi
 
@@ -452,7 +475,7 @@ teardown_worktree() { # <slug> <path>
       note "no isolation.redis_flush configured — redis db $N is left as is"
     fi
 
-    SLUG="$_old_slug"; N="$_old_n"
+    SLUG="$_old_slug"; N="$_old_n"; WT_PATH="$_old_path"
   fi
 
   rm -f "$STATE_DIR/$_ts.pid" "$STATE_DIR/$_ts.port" \
@@ -460,20 +483,49 @@ teardown_worktree() { # <slug> <path>
   true
 }
 
+# Both callers run teardown_worktree BEFORE this — the irreversible half:
+# server stopped, database dropped, redis slot flushed, every state file
+# removed. So a bare failure here is the worst kind: set -e aborts on the
+# spot, the user sees only git's stderr, "removed" never prints, and emit_cd
+# never runs, leaving a shell-wrapper caller sitting in a deleted directory
+# with no explanation. Every git call below is therefore guarded.
 remove_worktree_and_branch() { # <branch> <path> <keep_branch 0|1> <force 0|1>
+  _rm_hint="could not remove the worktree at $2 — its server, database and state were already reclaimed; remove the directory by hand, then run: git worktree prune"
   if [ "$4" = 1 ]; then
-    git worktree remove --force "$2" >&2
+    git worktree remove --force "$2" >&2 || die "$_rm_hint"
   else
-    git worktree remove "$2" >&2
+    git worktree remove "$2" >&2 || die "$_rm_hint"
   fi
   if [ "$3" = 0 ]; then
     if [ "$4" = 1 ]; then
-      git branch -D "$1" >&2
+      git branch -D "$1" >&2 \
+        || note "worktree removed, but git refused to delete branch $1 — delete it with: git branch -D $1"
     else
-      git branch -d "$1" >&2
+      # -d asks "is this merged into HEAD (or its upstream)?", which is NOT
+      # the question cmd_rm already answered ("merged into trunk?"). Removing
+      # a SIBLING worktree leaves cwd — and so HEAD — on the caller's own
+      # branch, so -d can refuse a branch wt has verified. note, not die: the
+      # branch is the one recoverable thing left, and dying here would skip
+      # emit_cd and strand a shell-wrapper caller in a deleted directory.
+      git branch -d "$1" >&2 \
+        || note "worktree removed, but git refused to delete branch $1 (not merged into HEAD) — delete it with: git branch -D $1"
     fi
   fi
   true
+}
+
+# Puts the worktree at $1 back on $2 after a failed merge step, and prints
+# the tail of the caller's die message so the two lines a panicking user
+# reads tell ONE story. The old shape printed "could not restore the
+# worktree" and then died saying "$branch restored to $orig" — flatly
+# contradictory, on the one path where the user most needs to be told the
+# truth. git's own output goes to stderr, so it never reaches this stdout.
+restore_after_merge() { # <path> <orig-sha> <backup-ref> -> phrase on stdout
+  if git -C "$1" reset --hard "$2" >&2; then
+    printf 'restored to %s (backup: %s)' "$2" "$3"
+  else
+    printf 'could NOT be restored — recover by hand: git -C %s reset --hard %s' "$1" "$3"
+  fi
 }
 
 confirm() { # <prompt> — 0 on yes, reading stdin
@@ -832,7 +884,10 @@ cmd_doctor() {
     echo "shell:     integration active"
   else
     _rc_found=""
-    for _rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.config/fish/config.fish"; do
+    # ${HOME:-}, not $HOME: env -i, some CI runners and some container
+    # entrypoints leave HOME unset, where set -u makes a bare $HOME fatal.
+    _home="${HOME:-}"
+    for _rc in "$_home/.zshrc" "$_home/.bashrc" "$_home/.bash_profile" "$_home/.config/fish/config.fish"; do
       if [ -f "$_rc" ] && grep -q 'wt shell-init' "$_rc" 2>/dev/null; then _rc_found="$_rc"; break; fi
     done
     if [ -n "$_rc_found" ]; then
@@ -992,7 +1047,7 @@ cmd_rm() {
 
   _slug="$(slugify "$_path")"
   note "about to remove:"
-  note "  worktree  $_path"
+  note "  worktree  $_path (directory deleted, including untracked and ignored files)"
   if [ "$_keep" = 0 ]; then note "  branch    $_branch"; fi
   note "  state     $STATE_DIR/$_slug.*"
   if [ "${HAS_CONFIG:-0}" = 1 ] && [ -f "$STATE_DIR/$_slug.dbready" ]; then
@@ -1007,8 +1062,9 @@ cmd_rm() {
   # are inside it; the very next git call (branch -d/-D) then fails calling
   # getcwd() ("Unable to read current working directory") and set -e kills
   # cmd_rm before the branch is deleted or emit_cd runs. Step out first.
-  # runner_exec keys off $WT_PATH (a fixed global), not the live cwd, so
-  # this does not retarget teardown_worktree's own_db/redis work.
+  # runner_exec keys off $WT_PATH, not the live cwd, and teardown_worktree
+  # sets $WT_PATH to the target itself, so this cd does not retarget its
+  # own_db/redis work either way.
   if [ "$WT_PATH" = "$_path" ]; then _removed_cwd=1; cd "$PRIMARY"; fi
 
   teardown_worktree "$_slug" "$_path"
@@ -1090,9 +1146,7 @@ $_body"
   fi
   git -C "$_path" reset --soft "$_base" >&2
   if ! git -C "$_path" commit -q -m "$_msg" >&2; then
-    git -C "$_path" reset --hard "$_orig" >&2 \
-      || note "could not restore the worktree — recover by hand: git -C $_path reset --hard $_backup"
-    die "squash commit failed — $_branch restored to $_orig (backup: $_backup)"
+    die "squash commit failed — $_branch $(restore_after_merge "$_path" "$_orig" "$_backup")"
   fi
 
   # ---- rebase ----
@@ -1107,18 +1161,14 @@ $_body"
     git -C "$_path" rebase --abort >/dev/null 2>&1 \
       || git -C "$_path" checkout -f "$_branch" >/dev/null 2>&1 || true
     git -C "$_path" update-ref "refs/heads/$_branch" "$_orig"
-    git -C "$_path" reset --hard "$_orig" >&2 \
-      || note "could not restore the worktree — recover by hand: git -C $_path reset --hard $_backup"
-    die "rebase of $_branch onto $_trunk hit a conflict — $_branch restored to $_orig (backup: $_backup)
+    die "rebase of $_branch onto $_trunk hit a conflict — $_branch $(restore_after_merge "$_path" "$_orig" "$_backup")
 resolve by hand:  git -C $_path rebase $_trunk"
   fi
 
   # ---- fast-forward trunk ----
   _trunk_before="$(git -C "$PRIMARY" rev-parse "$_trunk")"
   if ! git -C "$PRIMARY" merge --ff-only "$_branch" >&2; then
-    git -C "$_path" reset --hard "$_orig" >&2 \
-      || note "could not restore the worktree — recover by hand: git -C $_path reset --hard $_backup"
-    die "$_trunk could not fast-forward to $_branch — it moved underneath us; $_branch restored to $_orig (backup: $_backup)"
+    die "$_trunk could not fast-forward to $_branch — it moved underneath us; $_branch $(restore_after_merge "$_path" "$_orig" "$_backup")"
   fi
   note "merged $_branch into $_trunk"
   note "undo:   git -C $PRIMARY reset --hard $_trunk_before   (branch backup: $_backup)"
@@ -1131,8 +1181,9 @@ resolve by hand:  git -C $_path rebase $_trunk"
   # are inside it; the very next git call (branch -d/-D) then fails calling
   # getcwd() ("Unable to read current working directory") and set -e kills
   # cmd_merge before the branch is deleted or emit_cd runs. Step out first.
-  # runner_exec keys off $WT_PATH (a fixed global), not the live cwd, so
-  # this does not retarget teardown_worktree's own_db/redis work.
+  # runner_exec keys off $WT_PATH, not the live cwd, and teardown_worktree
+  # sets $WT_PATH to the target itself, so this cd does not retarget its
+  # own_db/redis work either way.
   if [ "$WT_PATH" = "$_path" ]; then _removed_cwd=1; cd "$PRIMARY"; fi
   teardown_worktree "$_slug" "$_path"
   # force=1 here (not 0): the --ff-only merge above already PROVED every
@@ -1172,11 +1223,16 @@ wt() {
 EOF
       ;;
     fish)
+      # `env VAR=x wt`, not `VAR=x command wt`: fish gained single-command
+      # variable overrides late, and on older releases that form is a SYNTAX
+      # error — which would make `eval (wt shell-init fish)` break wt
+      # outright for those users. env resolves wt from PATH, so it finds the
+      # real binary rather than recursing into this function.
       cat <<'EOF'
 function wt
   switch "$argv[1]"
     case switch new rm merge
-      set -l __wt_d (WT_SHELL_INTEGRATION=1 command wt $argv)
+      set -l __wt_d (env WT_SHELL_INTEGRATION=1 wt $argv)
       or return $status
       if test -n "$__wt_d"
         cd $__wt_d

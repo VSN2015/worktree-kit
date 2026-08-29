@@ -173,7 +173,16 @@ isolation:
 - **`path`** (default `{parent}/{repo}-worktrees/{branch}`) — where
   `wt new <branch>` creates the worktree. **The last path segment becomes
   the slug**, and the slug names the port, the Redis `{n}` slot, and the
-  `wt_{slug}` database — so keep `{branch}` (or `{branch_raw}`) last. A
+  `wt_{slug}` database — so keep `{branch}` (or `{branch_raw}`) last.
+  `{branch}` folds every character outside `[A-Za-z0-9._]` to `_`,
+  **hyphens included**: `wt new feat/refund-flow` gives directory (and slug)
+  `feat_refund_flow`, not `feat_refund-flow`. That is on purpose — it makes
+  the directory name and the slug identical, so what you see in `wt list` is
+  exactly what names your database. (`.` is the one survivor: branch
+  `feat.x` gives directory `feat.x` but slug `feat_x`.) `{branch_raw}` keeps
+  the branch name verbatim, slashes and all — which nests directories and
+  makes only the final segment the slug, so use it in a middle segment, not
+  the last one. A
   template whose last segment isn't branch-unique (a fixed literal, say)
   makes every worktree share one slug, and with it one port, one Redis DB,
   and one database; `wt doctor` warns when it detects this. The expanded
@@ -261,6 +270,15 @@ Three levels, each a superset of the last:
   finding one that already existed, and `wt reset` hasn't cleared that
   marker since. Without `db_drop` configured (or when the database was only
   adopted), wt prints the database name and leaves it in place.
+  Two cases leave a database wt *did* create without that marker, and both
+  are deliberate — wt errs toward keeping data:
+  **(a)** databases bootstrapped **before wt 0.2.0**, when `.dbowned` did not
+  exist yet. On your first `wt rm` after upgrading, those report "no
+  ownership marker" and are left alone; drop them by hand, or run one
+  `wt reset <slug>` + `--own-db` cycle to re-bootstrap and re-mark them.
+  **(b)** a database re-adopted after `wt reset`: `db_check` (which the rails
+  templates configure) only ever writes `.dbready`, so the database that
+  `db_check` finds on the next run is never re-marked as owned.
 - **`redis_flush`** (optional) — empties this worktree's Redis DB `{n}` on
   `wt rm` / `wt merge`. Without it, the DB is left as-is.
 
@@ -678,6 +696,14 @@ or has commits not yet in the [trunk](#worktreespath--worktreestrunk);
 `--force` waives both the safety checks and the confirmation prompt.
 `--keep-branch` removes the worktree but leaves the branch.
 
+> [!WARNING]
+> `git worktree remove` deletes the **entire worktree directory**, not just
+> git's registration of it — including files git never tracked: `.env`, local
+> SQLite databases, uploads, `tmp/`, everything `.gitignore` covers. The
+> dirty-worktree refusal does not protect these; it only looks at tracked and
+> untracked files, and ignored files are invisible to it. Copy anything you
+> want to keep out first.
+
 ### wt merge — squash, rebase, fast-forward, tear down
 
 ```sh
@@ -687,9 +713,12 @@ wt merge [<branch>] [--into <trunk>] [-m <msg>] [--no-remove] [--force]
 Squashes every commit on `<branch>` since it diverged from the
 [trunk](#worktreespath--worktreestrunk) into one commit, rebases that commit
 onto the trunk, fast-forwards the trunk to it in the primary checkout, then
-tears the worktree down exactly like `wt rm` does — **without prompting**. A
-backup ref (`refs/wt/premerge/<slug>`) captures the branch's pre-squash HEAD
-before anything is rewritten; a squash failure, a rebase conflict, or a
+tears the worktree down like **`wt rm --force`** does — `git worktree remove
+--force` plus `git branch -D`, and **without prompting**. That deletes the
+whole worktree directory, gitignored files included (`.env`, local databases,
+uploads, `tmp/`), with no confirmation step in between. A backup ref
+(`refs/wt/premerge/<slug>`) captures the branch's pre-squash HEAD before
+anything is rewritten; a squash failure, a rebase conflict, or a
 non-fast-forward trunk all restore the branch to that commit and leave the
 worktree in place, with the recovery command printed. `--into <trunk>`
 overrides `worktrees.trunk` for this run; `-m <msg>` sets the squash commit
@@ -701,7 +730,10 @@ body); `--no-remove` merges without tearing down.
 > Its `--force` only waives the one guard that exists: refusing to squash a
 > branch that has an upstream (squashing would rewrite already-published
 > history). This is different from `wt rm --force`, which waives both the
-> safety refusals *and* the confirmation prompt.
+> safety refusals *and* the confirmation prompt. Note that the teardown is
+> the forceful kind either way — passing `--force` does not make it any more
+> destructive, and omitting it does not make it any less. Use `--no-remove`
+> if you want the worktree directory kept.
 
 ### wt list — see every worktree
 
