@@ -6,6 +6,10 @@ set -eu
 
 WT="${WT:-wt}"
 TMP="$(mktemp -d)"
+# Canonicalize: on macOS $TMPDIR lives under a symlink (/var -> /private/var),
+# but git resolves absolute paths, so exact-path assertions below would
+# otherwise compare an unresolved $TMP against wt's resolved output.
+TMP="$(cd "$TMP" && pwd -P)"
 trap 'rm -rf "$TMP"' EXIT
 FAILED=0
 TAB="$(printf '\t')"
@@ -85,6 +89,44 @@ new_repo nodockerrepo
 printf 'hooks:\n  server: "true"\n' > worktree-kit.yml
 out="$(PATH=/usr/bin:/bin "$WT" list)"
 assert_contains "$out" master "list: works with a compose config and no docker on PATH"
+
+# ---------- Task 2: new ----------
+
+new_repo newrepo
+out="$("$WT" new feat/refund-flow 2>/dev/null)"
+assert_eq "$TMP/newrepo-worktrees/feat_refund_flow" "$out" \
+  "new: default template, branch sanitized for the path"
+assert_eq "0" "$(test -d "$TMP/newrepo-worktrees/feat_refund_flow"; echo $?)" \
+  "new: directory created"
+assert_contains "$(git -C "$REPO" branch --list 'feat/refund-flow')" "feat/refund-flow" \
+  "new: branch created with slashes intact"
+assert_contains "$("$WT" list)" "feat_refund_flow" "new: slug is the last path segment"
+
+# a branch that exists but has no worktree is adopted, not rejected
+git -C "$REPO" branch -q orphan
+out="$("$WT" new orphan 2>/dev/null)"
+assert_eq "$TMP/newrepo-worktrees/orphan" "$out" "new: adopts an existing branch"
+
+# a branch that already has a worktree is an error
+assert_fails "new: rejects a branch that already has a worktree" "$WT" new orphan
+
+# --from picks the base
+git -C "$REPO" checkout -q -b basis
+echo b > "$REPO/b.txt"; git -C "$REPO" add b.txt; git -C "$REPO" commit -qm basis
+git -C "$REPO" checkout -q master
+"$WT" new derived --from basis >/dev/null 2>&1
+assert_eq "0" "$(test -f "$TMP/newrepo-worktrees/derived/b.txt"; echo $?)" \
+  "new --from: branched from the named base"
+
+# a template that yields a space is refused before anything is created
+new_repo spacerepo
+printf 'runner: host\nhooks:\n  server: "true"\n' > worktree-kit.yml
+cat > worktree-kit.local.yml <<'YML'
+worktrees:
+  path: "{parent}/has space/{branch}"
+YML
+assert_fails "new: refuses a path containing a space" "$WT" new anything
+assert_eq "1" "$(test -d "$TMP/has space" && echo 0 || echo 1)" "new: nothing created on refusal"
 
 [ "$FAILED" = 0 ] || { echo "LIFECYCLE FAIL" >&2; exit 1; }
 echo "LIFECYCLE PASS"

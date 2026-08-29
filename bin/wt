@@ -349,6 +349,42 @@ worktree_rows() {
   true
 }
 
+sanitize_branch() { # <branch> -> filesystem-safe
+  printf '%s' "$1" | tr -c 'A-Za-z0-9._' '_'
+}
+
+path_template() {
+  _t=""
+  if [ "${HAS_CONFIG:-0}" = 1 ]; then
+    _t="$(local_get worktrees.path "")"
+    if [ -z "$_t" ]; then _t="$(cfg_get worktrees.path "")"; fi
+  fi
+  if [ -z "$_t" ]; then _t='{parent}/{repo}-worktrees/{branch}'; fi
+  printf '%s\n' "$_t"
+}
+
+# {branch_raw} MUST be substituted before {branch}, or the longer token is
+# eaten by the shorter one and leaves a stray "_raw".
+expand_path() { # <template> <raw-branch>
+  _pb="$(sanitize_branch "$2")"
+  _pp="$(dirname "$PRIMARY")"
+  _pr="$(basename "$PRIMARY")"
+  printf '%s' "$1" | sed \
+    -e "s|{branch_raw}|$2|g" \
+    -e "s|{parent}|$_pp|g" \
+    -e "s|{repo}|$_pr|g" \
+    -e "s|{branch}|$_pb|g" \
+    -e "s|{home}|$HOME|g"
+}
+
+# stdout is the cd channel: a path, and nothing else.
+emit_cd() { # <path>
+  printf '%s\n' "$1"
+  if [ -z "${WT_SHELL_INTEGRATION:-}" ]; then
+    note "not cd'd — install shell integration: eval \"\$(wt shell-init zsh)\""
+  fi
+}
+
 # ---------- ports ----------
 
 # lsof (macOS) -> ss (Linux) -> bind probe via ruby/python3 -> assume free.
@@ -673,6 +709,59 @@ cmd_doctor() {
   echo "ok"
 }
 
+cmd_new() {
+  load_config_soft
+  _base=""; _start_server=0; _branch=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)   _base="${2:-}"; [ -n "$_base" ] || die "--from needs a branch or commit"; shift 2 ;;
+      --server) _start_server=1; shift ;;
+      -*)       die "unknown flag: $1 (wt new <branch> [--from <base>] [--server])" ;;
+      *)        _branch="$1"; shift ;;
+    esac
+  done
+  [ -n "$_branch" ] || die "usage: wt new <branch> [--from <base>] [--server]"
+
+  _existing="$(worktree_for_branch "$_branch")"
+  if [ -n "$_existing" ]; then
+    die "branch $_branch already has a worktree at $_existing — use: wt switch $_branch"
+  fi
+
+  _path="$(expand_path "$(path_template)" "$_branch")"
+  case "$_path" in
+    *" "*) die "worktrees.path expands to a path containing a space:
+  $_path
+wt splits unquoted strings when building compose args and host env lists, so
+worktree paths must be space-free. Change worktrees.path or the branch name." ;;
+  esac
+  if [ -e "$_path" ]; then die "$_path already exists"; fi
+
+  mkdir -p "$(dirname "$_path")"
+  if git show-ref --verify --quiet "refs/heads/$_branch"; then
+    note "adopting existing branch $_branch"
+    git worktree add "$_path" "$_branch" >&2
+  elif [ -n "$_base" ]; then
+    git worktree add -b "$_branch" "$_path" "$_base" >&2
+  else
+    git worktree add -b "$_branch" "$_path" >&2
+  fi
+
+  # Hook output goes to stderr so it cannot pollute the cd channel.
+  if [ "$HAS_CONFIG" = 1 ] && [ -n "${PREPARE:-}" ]; then
+    note "prepare: $PREPARE"
+    if ! ( cd "$_path" && "$0" run --shared -- sh -c "$PREPARE" ) >&2; then
+      die "prepare hook failed — worktree left at $_path"
+    fi
+  fi
+
+  if [ "$_start_server" = 1 ]; then
+    if [ "$HAS_CONFIG" = 0 ]; then die "--server needs worktree-kit.yml — run 'wt init'"; fi
+    ( cd "$_path" && "$0" server ) >&2 || die "server failed to start in $_path"
+  fi
+
+  emit_cd "$_path"
+}
+
 cmd_list() {
   load_config_soft
   _all=0
@@ -714,6 +803,7 @@ wt — worktree-aware runner (config: worktree-kit.yml at the primary checkout)
   wt logs [slug]         follow a server's logs
   wt localize <file...>  snapshot a personal overlay (--list / --remove)
   wt reset [slug]        clear the own-db bootstrap marker
+  wt new <branch> [--from <base>] [--server]   create a branch + worktree
   wt list [--all]        list worktrees (branch, slug, status, server, isolation)
   wt init                write worktree-kit.yml from a stack template
   wt doctor              environment + config checks
@@ -736,6 +826,7 @@ case "$1" in
   logs) shift; cmd_logs "$@" ;;
   localize) shift; cmd_localize "$@" ;;
   reset) shift; cmd_reset "$@" ;;
+  new) shift; cmd_new "$@" ;;
   list) shift; cmd_list "$@" ;;
   init) shift; cmd_init "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
