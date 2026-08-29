@@ -385,6 +385,38 @@ emit_cd() { # <path>
   fi
 }
 
+# Prints the selected worktree path. fzf draws on /dev/tty and prints only
+# the selection to stdout, so it composes with the cd channel.
+pick_worktree() {
+  _rows="$(worktree_rows)"
+  if [ -z "$_rows" ]; then die "no worktrees"; fi
+
+  if command -v fzf >/dev/null 2>&1; then
+    _sel="$(printf '%s\n' "$_rows" | fzf \
+      --delimiter="$TAB" --with-nth=1,2,3,4 \
+      --preview 'git -C {6} log --oneline -10; echo; git -C {6} status -s' \
+      --preview-window=right:60%)" || return 1
+  else
+    _tmp="$STATE_DIR/.picker.$$"
+    printf '%s\n' "$_rows" > "$_tmp"
+    _i=0
+    while IFS="$TAB" read -r _b _s _st _srv _iso _p; do
+      _i=$((_i + 1))
+      printf '%2d) %-28s %s\n' "$_i" "$_b" "$_p" >&2
+    done < "$_tmp"
+    printf 'select worktree [1-%d]: ' "$_i" >&2
+    if ! read -r _n < /dev/tty; then rm -f "$_tmp"; return 1; fi
+    case "$_n" in
+      ''|*[!0-9]*) rm -f "$_tmp"; die "not a number: $_n" ;;
+    esac
+    if [ "$_n" -lt 1 ] || [ "$_n" -gt "$_i" ]; then rm -f "$_tmp"; die "out of range: $_n"; fi
+    _sel="$(sed -n "${_n}p" "$_tmp")"
+    rm -f "$_tmp"
+  fi
+
+  printf '%s' "$_sel" | cut -f6
+}
+
 # ---------- ports ----------
 
 # lsof (macOS) -> ss (Linux) -> bind probe via ruby/python3 -> assume free.
@@ -797,6 +829,64 @@ $_b${TAB}-${TAB}(no worktree)${TAB}-${TAB}-${TAB}-"
   fi
 }
 
+cmd_switch() {
+  load_config_soft
+  if [ $# -eq 0 ]; then
+    _p="$(pick_worktree)" || exit 1
+    if [ -z "$_p" ]; then exit 1; fi
+    emit_cd "$_p"
+    return 0
+  fi
+
+  _p="$(worktree_for_branch "$1")"
+  if [ -z "$_p" ]; then
+    if git show-ref --verify --quiet "refs/heads/$1"; then
+      die "branch $1 has no worktree — create one: wt new $1"
+    fi
+    die "no worktree or branch named $1 (see: wt list --all)"
+  fi
+  emit_cd "$_p"
+}
+
+cmd_shell_init() {
+  _kind="${1:-}"
+  if [ -z "$_kind" ]; then _kind="$(basename "${SHELL:-sh}")"; fi
+  case "$_kind" in
+    bash|zsh)
+      cat <<'EOF'
+wt() {
+  case "${1:-}" in
+    switch|new|rm|merge)
+      local __wt_d
+      __wt_d="$(WT_SHELL_INTEGRATION=1 command wt "$@")" || return $?
+      # explicit if, not &&: a command that prints no path must still return 0
+      if [ -n "$__wt_d" ]; then cd "$__wt_d"; fi
+      ;;
+    *) command wt "$@" ;;
+  esac
+}
+EOF
+      ;;
+    fish)
+      cat <<'EOF'
+function wt
+  switch "$argv[1]"
+    case switch new rm merge
+      set -l __wt_d (WT_SHELL_INTEGRATION=1 command wt $argv)
+      or return $status
+      if test -n "$__wt_d"
+        cd $__wt_d
+      end
+    case '*'
+      command wt $argv
+  end
+end
+EOF
+      ;;
+    *) die "unsupported shell: $_kind (bash, zsh, fish)" ;;
+  esac
+}
+
 usage() {
   cat <<'EOF'
 wt — worktree-aware runner (config: worktree-kit.yml at the primary checkout)
@@ -810,9 +900,11 @@ wt — worktree-aware runner (config: worktree-kit.yml at the primary checkout)
   wt localize <file...>  snapshot a personal overlay (--list / --remove)
   wt reset [slug]        clear the own-db bootstrap marker
   wt new <branch> [--from <base>] [--server]   create a branch + worktree
+  wt switch [<branch>]   cd to a worktree; no argument opens a picker
   wt list [--all]        list worktrees (branch, slug, status, server, isolation)
   wt init                write worktree-kit.yml from a stack template
   wt doctor              environment + config checks
+  wt shell-init [bash|zsh|fish]   emit the shell function that makes switch cd
 EOF
 }
 
@@ -820,6 +912,7 @@ EOF
 case "${1:-}" in
   -h|--help|help|'') usage; exit 0 ;;
   -v|--version) echo "wt $WT_VERSION"; exit 0 ;;
+  shell-init) shift; cmd_shell_init "$@"; exit 0 ;;
 esac
 
 ctx_init
@@ -833,6 +926,7 @@ case "$1" in
   localize) shift; cmd_localize "$@" ;;
   reset) shift; cmd_reset "$@" ;;
   new) shift; cmd_new "$@" ;;
+  switch) shift; cmd_switch "$@" ;;
   list) shift; cmd_list "$@" ;;
   init) shift; cmd_init "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;

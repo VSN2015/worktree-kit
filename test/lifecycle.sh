@@ -141,5 +141,41 @@ printf 'runner: host\nhooks:\n  prepare: "echo x >> %s"\n  server: "true"\n' "$_
 "$WT" new prepped >/dev/null 2>&1
 assert_eq "1" "$(wc -l < "$_counter" | tr -d ' ')" "new: prepare hook runs exactly once"
 
+# ---------- Task 3: switch and shell-init ----------
+
+new_repo switchrepo
+"$WT" new feat/alpha >/dev/null 2>&1
+
+# stdout carries only the path; the hint goes to stderr
+out="$("$WT" switch feat/alpha 2>/dev/null)"
+assert_eq "$TMP/switchrepo-worktrees/feat_alpha" "$out" "switch: stdout is the bare path"
+
+err="$("$WT" switch feat/alpha 2>&1 >/dev/null)"
+assert_contains "$err" "shell-init" "switch: hints about shell integration on stderr"
+
+err="$(WT_SHELL_INTEGRATION=1 "$WT" switch feat/alpha 2>&1 >/dev/null)"
+assert_eq "" "$err" "switch: no stderr noise under shell integration"
+
+assert_fails "switch: unknown branch is an error" "$WT" switch nope
+err="$("$WT" switch nope 2>&1 >/dev/null || true)"
+assert_contains "$err" "nope" "switch: names the branch it could not find"
+
+git -C "$REPO" branch -q lonely
+err="$("$WT" switch lonely 2>&1 >/dev/null || true)"
+assert_contains "$err" "wt new lonely" "switch: branch without a worktree points at wt new"
+
+# shell-init emits a wrapper covering all four cd-channel commands
+out="$("$WT" shell-init zsh)"
+assert_contains "$out" "switch|new|rm|merge" "shell-init: wraps every cd-channel command"
+assert_contains "$out" "WT_SHELL_INTEGRATION=1" "shell-init: exports the marker"
+assert_contains "$out" 'if [ -n "$__wt_d" ]; then' "shell-init: explicit if, not && (bug 1)"
+out="$("$WT" shell-init fish)"
+assert_contains "$out" "function wt" "shell-init: fish variant"
+assert_fails "shell-init: rejects an unknown shell" "$WT" shell-init tcsh
+
+# shell-init must work outside a git repo
+out="$(cd "$TMP" && "$WT" shell-init bash)"
+assert_contains "$out" "command wt" "shell-init: works outside a git repo"
+
 [ "$FAILED" = 0 ] || { echo "LIFECYCLE FAIL" >&2; exit 1; }
 echo "LIFECYCLE PASS"
