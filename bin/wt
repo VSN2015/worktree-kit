@@ -746,10 +746,16 @@ worktree paths must be space-free. Change worktrees.path or the branch name." ;;
     git worktree add -b "$_branch" "$_path" >&2
   fi
 
-  # Hook output goes to stderr so it cannot pollute the cd channel.
-  if [ "$HAS_CONFIG" = 1 ] && [ -n "${PREPARE:-}" ]; then
+  # The prepare hook must run exactly once. `wt run` already runs
+  # hooks.prepare itself before execing its payload, so the payload here is
+  # inert (`true`) — passing the hook again as the payload would run it
+  # twice. When --server is requested, skip this step entirely: `wt server`
+  # runs hooks.prepare as part of its own command string, so running it
+  # here too would make it run twice for the bare case and three times
+  # once the server path also fires it.
+  if [ "$_start_server" = 0 ] && [ "$HAS_CONFIG" = 1 ] && [ -n "${PREPARE:-}" ]; then
     note "prepare: $PREPARE"
-    if ! ( cd "$_path" && "$0" run --shared -- sh -c "$PREPARE" ) >&2; then
+    if ! ( cd "$_path" && "$0" run --shared -- true ) >&2; then
       die "prepare hook failed — worktree left at $_path"
     fi
   fi

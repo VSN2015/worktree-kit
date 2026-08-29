@@ -128,5 +128,18 @@ YML
 assert_fails "new: refuses a path containing a space" "$WT" new anything
 assert_eq "1" "$(test -d "$TMP/has space" && echo 0 || echo 1)" "new: nothing created on refusal"
 
+# hooks.prepare must run exactly once. cmd_new used to hand the hook itself
+# to `wt run` as its payload, on top of `wt run` already running the hook
+# before execing its payload — silently double-running seed/migration
+# scripts. The counter lives outside the worktree so it survives the
+# prepare hook's own cwd (the new worktree) and can be inspected here.
+new_repo prepcountrepo
+_counter="$TMP/prepare-count.txt"
+: > "$_counter"
+printf 'runner: host\nhooks:\n  prepare: "echo x >> %s"\n  server: "true"\n' "$_counter" \
+  > worktree-kit.yml
+"$WT" new prepped >/dev/null 2>&1
+assert_eq "1" "$(wc -l < "$_counter" | tr -d ' ')" "new: prepare hook runs exactly once"
+
 [ "$FAILED" = 0 ] || { echo "LIFECYCLE FAIL" >&2; exit 1; }
 echo "LIFECYCLE PASS"
