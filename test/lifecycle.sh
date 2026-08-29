@@ -230,5 +230,75 @@ printf 'n\n' | "$WT" rm feat/spared >/dev/null 2>&1 || true
 assert_eq "0" "$(test -d "$TMP/rmrepo-worktrees/feat_spared" && echo 0 || echo 1)" \
   "rm: declining the prompt keeps the worktree"
 
+# ---------- Task 4 fix round 1 ----------
+
+# Item 3: from inside the worktree being removed, wt rm must survive git's
+# cwd being yanked out from under it (git worktree remove deletes the cwd,
+# then git branch -d's getcwd() call dies) and still land the caller in the
+# primary via the cd channel. Runs first, in rmrepo, while $REPO/cwd still
+# point there — every later block in this section calls new_repo again.
+"$WT" new feat/herecwd >/dev/null 2>&1
+wtdir_here="$TMP/rmrepo-worktrees/feat_herecwd"
+rmrepo_repo="$REPO"
+out="$( (cd "$wtdir_here" && "$WT" rm feat/herecwd --force 2>/dev/null) || true )"
+assert_eq "$rmrepo_repo" "$out" "rm: from inside the worktree, prints the primary for cd"
+
+# Item 1: the entire HAS_CONFIG=1 teardown branch (server-stop, the db
+# ownership gate, db_drop, redis_flush, the "left behind" notices, and the
+# SLUG/N borrow) is otherwise never exercised — rmrepo above has no config.
+new_repo cfgrmrepo
+db_sentinel="$TMP/db-drop.sentinel"
+redis_sentinel="$TMP/redis-flush.sentinel"
+cat > worktree-kit.yml <<YML
+runner: host
+hooks:
+  server: "true"
+isolation:
+  db_drop: "echo dropped-{slug} >> $db_sentinel"
+  redis_flush: "echo flushed-{slug}-{n} >> $redis_sentinel"
+YML
+"$WT" new feat/owned >/dev/null 2>&1
+"$WT" new feat/adopted >/dev/null 2>&1
+cfgstate="$REPO/.git/wt-state"
+# feat_owned: the kit bootstrapped this database itself.
+: > "$cfgstate/feat_owned.dbready"
+: > "$cfgstate/feat_owned.dbowned"
+# feat_adopted: db_check found a pre-existing database and merely adopted
+# it (ensure_own_db touches .dbready but never .dbowned on that path) — it
+# stands in for a database wt rm must never drop.
+: > "$cfgstate/feat_adopted.dbready"
+
+"$WT" rm feat/owned --force >/dev/null 2>&1
+assert_contains "$(cat "$db_sentinel" 2>/dev/null)" "dropped-feat_owned" \
+  "rm: drops a database the kit itself bootstrapped"
+assert_contains "$(cat "$redis_sentinel" 2>/dev/null)" "flushed-feat_owned-" \
+  "rm: flushes the redis slot for a configured worktree (SLUG/N borrow works)"
+
+"$WT" rm feat/adopted --force >/dev/null 2>&1
+assert_missing "$(cat "$db_sentinel" 2>/dev/null)" "dropped-feat_adopted" \
+  "rm: never drops a database it only adopted (.dbready without .dbowned)"
+
+# Item 2: a configured trunk that does not resolve as a ref in this worktree
+# must not be silently treated as "nothing unmerged" — "cannot check" must
+# not mean "safe to delete" for a destructive command.
+new_repo trunkguardrepo
+printf 'runner: host\nhooks:\n  server: "true"\nworktrees:\n  trunk: develop\n' \
+  > worktree-kit.yml
+"$WT" new feat/risky >/dev/null 2>&1
+( cd "$TMP/trunkguardrepo-worktrees/feat_risky" && echo x > x.txt && git add x.txt && git commit -qm risky )
+printf 'y\n' | "$WT" rm feat/risky >/dev/null 2>&1 || true
+assert_eq "0" "$(test -d "$TMP/trunkguardrepo-worktrees/feat_risky" && echo 0 || echo 1)" \
+  "rm: an unverifiable configured trunk refuses rather than failing open"
+
+# Item 4: a failed server-stop must be surfaced, not swallowed — otherwise
+# state files vanish, wt ps can no longer see the orphaned server, and wt rm
+# still reports success.
+new_repo swallowfailrepo
+printf 'hooks:\n  server: "true"\n' > worktree-kit.yml
+"$WT" new feat/failstop >/dev/null 2>&1
+err="$(PATH=/usr/bin:/bin "$WT" rm feat/failstop --force 2>&1 >/dev/null)"
+assert_contains "$err" "could not stop the server" \
+  "rm: a failed server-stop is reported, not swallowed"
+
 [ "$FAILED" = 0 ] || { echo "LIFECYCLE FAIL" >&2; exit 1; }
 echo "LIFECYCLE PASS"

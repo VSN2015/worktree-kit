@@ -424,19 +424,23 @@ teardown_worktree() { # <slug> <path>
   _ts="$1"; _tp="$2"
 
   if [ "${HAS_CONFIG:-0}" = 1 ]; then
-    "$0" down "$_ts" >&2 || true
+    "$0" down "$_ts" >&2 || note "could not stop the server for $_ts — check for a stray process"
 
     # expand() reads the globals SLUG and N; borrow them for the target slug
     _old_slug="$SLUG"; _old_n="$N"
     SLUG="$_ts"; N=$(( $(hashnum "$_ts") % 15 + 1 ))
 
     if [ -f "$STATE_DIR/$_ts.dbready" ]; then
-      _drop="$(cfg_get isolation.db_drop "")"
-      if [ -n "$_drop" ]; then
-        note "dropping database for $_ts"
-        runner_exec own_db "$(expand "$_drop")" >&2 || note "db_drop failed — the database may remain"
+      if [ -f "$STATE_DIR/$_ts.dbowned" ]; then
+        _drop="$(cfg_get isolation.db_drop "")"
+        if [ -n "$_drop" ]; then
+          note "dropping database for $_ts"
+          runner_exec own_db "$(expand "$_drop")" >&2 || note "db_drop failed — the database may remain"
+        else
+          note "no isolation.db_drop configured — the database for slug $_ts is left in place"
+        fi
       else
-        note "no isolation.db_drop configured — the database for slug $_ts is left in place"
+        note "database for slug $_ts was adopted, not created by wt — leaving it in place"
       fi
     fi
 
@@ -452,7 +456,7 @@ teardown_worktree() { # <slug> <path>
   fi
 
   rm -f "$STATE_DIR/$_ts.pid" "$STATE_DIR/$_ts.port" \
-        "$STATE_DIR/$_ts.dbready" "$STATE_DIR/logs/$_ts.log"
+        "$STATE_DIR/$_ts.dbready" "$STATE_DIR/$_ts.dbowned" "$STATE_DIR/logs/$_ts.log"
   true
 }
 
@@ -550,7 +554,10 @@ ensure_own_db() {
   [ -n "$boot" ] || die "own-db needs isolation.db_bootstrap in worktree-kit.yml"
   note "bootstrapping isolated database for $SLUG ..."
   runner_exec own_db "$(expand "$boot")"
-  touch "$marker"
+  # .dbowned records that the kit itself created this database (as opposed
+  # to the db_check branch above, which only found one already there) — wt
+  # rm/merge must never drop a database they did not create.
+  touch "$marker" "$STATE_DIR/$SLUG.dbowned"
 }
 
 # ---------- compose runner ----------
@@ -937,6 +944,13 @@ cmd_rm() {
     # upstream, so an unpushed test would refuse every agent worktree.
     _trunk="$(resolve_trunk)"
     if [ -n "$_trunk" ]; then
+      # A configured worktrees.trunk is returned as-is, unverified — it can
+      # name a ref this worktree cannot resolve (e.g. a remote-only branch).
+      # "cannot check" must never be treated as "nothing unmerged" for a
+      # destructive command, so require the ref to resolve before counting.
+      if ! git -C "$_path" rev-parse --verify --quiet "$_trunk" >/dev/null 2>&1; then
+        die "cannot verify $_branch is merged — $_trunk not found in this worktree, use --force"
+      fi
       _un="$(git -C "$_path" rev-list --count "$_trunk..$_branch" 2>/dev/null || echo 0)"
       if [ "$_un" -gt 0 ]; then
         die "$_branch has $_un commit(s) not in $_trunk — merge them (wt merge $_branch), or use --force"
@@ -957,7 +971,13 @@ cmd_rm() {
   fi
 
   _removed_cwd=0
-  if [ "$WT_PATH" = "$_path" ]; then _removed_cwd=1; fi
+  # git worktree remove deletes the cwd out from under this process when we
+  # are inside it; the very next git call (branch -d/-D) then fails calling
+  # getcwd() ("Unable to read current working directory") and set -e kills
+  # cmd_rm before the branch is deleted or emit_cd runs. Step out first.
+  # runner_exec keys off $WT_PATH (a fixed global), not the live cwd, so
+  # this does not retarget teardown_worktree's own_db/redis work.
+  if [ "$WT_PATH" = "$_path" ]; then _removed_cwd=1; cd "$PRIMARY"; fi
 
   teardown_worktree "$_slug" "$_path"
   remove_worktree_and_branch "$_branch" "$_path" "$_keep" "$_force"
