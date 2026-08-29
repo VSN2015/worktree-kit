@@ -417,6 +417,70 @@ pick_worktree() {
   printf '%s' "$_sel" | cut -f6
 }
 
+# Reclaims everything the kit provisioned for a slug. Does NOT touch the
+# worktree directory or the branch. Overlays under $OVERLAY_DIR are per-file
+# and personal, never per-worktree — they are deliberately left alone.
+teardown_worktree() { # <slug> <path>
+  _ts="$1"; _tp="$2"
+
+  if [ "${HAS_CONFIG:-0}" = 1 ]; then
+    "$0" down "$_ts" >&2 || true
+
+    # expand() reads the globals SLUG and N; borrow them for the target slug
+    _old_slug="$SLUG"; _old_n="$N"
+    SLUG="$_ts"; N=$(( $(hashnum "$_ts") % 15 + 1 ))
+
+    if [ -f "$STATE_DIR/$_ts.dbready" ]; then
+      _drop="$(cfg_get isolation.db_drop "")"
+      if [ -n "$_drop" ]; then
+        note "dropping database for $_ts"
+        runner_exec own_db "$(expand "$_drop")" >&2 || note "db_drop failed — the database may remain"
+      else
+        note "no isolation.db_drop configured — the database for slug $_ts is left in place"
+      fi
+    fi
+
+    _flush="$(cfg_get isolation.redis_flush "")"
+    if [ -n "$_flush" ]; then
+      note "flushing redis db $N for $_ts"
+      runner_exec isolated "$(expand "$_flush")" >&2 || note "redis_flush failed — db $N may still hold keys"
+    else
+      note "no isolation.redis_flush configured — redis db $N is left as is"
+    fi
+
+    SLUG="$_old_slug"; N="$_old_n"
+  fi
+
+  rm -f "$STATE_DIR/$_ts.pid" "$STATE_DIR/$_ts.port" \
+        "$STATE_DIR/$_ts.dbready" "$STATE_DIR/logs/$_ts.log"
+  true
+}
+
+remove_worktree_and_branch() { # <branch> <path> <keep_branch 0|1> <force 0|1>
+  if [ "$4" = 1 ]; then
+    git worktree remove --force "$2" >&2
+  else
+    git worktree remove "$2" >&2
+  fi
+  if [ "$3" = 0 ]; then
+    if [ "$4" = 1 ]; then
+      git branch -D "$1" >&2
+    else
+      git branch -d "$1" >&2
+    fi
+  fi
+  true
+}
+
+confirm() { # <prompt> — 0 on yes, reading stdin
+  printf '%s [y/N] ' "$1" >&2
+  read -r _ans || _ans=n
+  case "$_ans" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # ---------- ports ----------
 
 # lsof (macOS) -> ss (Linux) -> bind probe via ruby/python3 -> assume free.
@@ -848,6 +912,60 @@ cmd_switch() {
   emit_cd "$_p"
 }
 
+cmd_rm() {
+  load_config_soft
+  _force=0; _keep=0; _branch=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--force)    _force=1; shift ;;
+      --keep-branch) _keep=1; shift ;;
+      -*)            die "unknown flag: $1 (wt rm [<branch>] [--keep-branch] [--force])" ;;
+      *)             _branch="$1"; shift ;;
+    esac
+  done
+  if [ -z "$_branch" ]; then _branch="$(git rev-parse --abbrev-ref HEAD)"; fi
+
+  _path="$(worktree_for_branch "$_branch")"
+  if [ -z "$_path" ]; then die "no worktree for branch $_branch (see: wt list)"; fi
+  if [ "$_path" = "$PRIMARY" ]; then die "refusing to remove the primary checkout at $PRIMARY"; fi
+
+  if [ "$_force" = 0 ]; then
+    if [ -n "$(git -C "$_path" status --porcelain)" ]; then
+      die "$_branch has uncommitted changes — commit them, or use --force"
+    fi
+    # Deliberately reachability, not "unpushed": a local-only branch has no
+    # upstream, so an unpushed test would refuse every agent worktree.
+    _trunk="$(resolve_trunk)"
+    if [ -n "$_trunk" ]; then
+      _un="$(git -C "$_path" rev-list --count "$_trunk..$_branch" 2>/dev/null || echo 0)"
+      if [ "$_un" -gt 0 ]; then
+        die "$_branch has $_un commit(s) not in $_trunk — merge them (wt merge $_branch), or use --force"
+      fi
+    fi
+  fi
+
+  _slug="$(slugify "$_path")"
+  note "about to remove:"
+  note "  worktree  $_path"
+  if [ "$_keep" = 0 ]; then note "  branch    $_branch"; fi
+  note "  state     $STATE_DIR/$_slug.*"
+  if [ "${HAS_CONFIG:-0}" = 1 ] && [ -f "$STATE_DIR/$_slug.dbready" ]; then
+    note "  database  provisioned for slug $_slug"
+  fi
+  if [ "$_force" = 0 ]; then
+    confirm "proceed?" || die "aborted"
+  fi
+
+  _removed_cwd=0
+  if [ "$WT_PATH" = "$_path" ]; then _removed_cwd=1; fi
+
+  teardown_worktree "$_slug" "$_path"
+  remove_worktree_and_branch "$_branch" "$_path" "$_keep" "$_force"
+  note "removed $_branch"
+
+  if [ "$_removed_cwd" = 1 ]; then emit_cd "$PRIMARY"; fi
+}
+
 cmd_shell_init() {
   _kind="${1:-}"
   if [ -z "$_kind" ]; then _kind="$(basename "${SHELL:-sh}")"; fi
@@ -901,6 +1019,7 @@ wt — worktree-aware runner (config: worktree-kit.yml at the primary checkout)
   wt reset [slug]        clear the own-db bootstrap marker
   wt new <branch> [--from <base>] [--server]   create a branch + worktree
   wt switch [<branch>]   cd to a worktree; no argument opens a picker
+  wt rm [<branch>] [--keep-branch] [--force]   tear down and remove a worktree
   wt list [--all]        list worktrees (branch, slug, status, server, isolation)
   wt init                write worktree-kit.yml from a stack template
   wt doctor              environment + config checks
@@ -927,6 +1046,7 @@ case "$1" in
   reset) shift; cmd_reset "$@" ;;
   new) shift; cmd_new "$@" ;;
   switch) shift; cmd_switch "$@" ;;
+  rm) shift; cmd_rm "$@" ;;
   list) shift; cmd_list "$@" ;;
   init) shift; cmd_init "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;

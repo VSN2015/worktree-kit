@@ -177,5 +177,58 @@ assert_fails "shell-init: rejects an unknown shell" "$WT" shell-init tcsh
 out="$(cd "$TMP" && "$WT" shell-init bash)"
 assert_contains "$out" "command wt" "shell-init: works outside a git repo"
 
+# ---------- Task 4: rm ----------
+
+new_repo rmrepo
+"$WT" new feat/gone >/dev/null 2>&1
+wtdir="$TMP/rmrepo-worktrees/feat_gone"
+
+# fabricate the state files a server would have left behind
+state="$REPO/.git/wt-state"
+mkdir -p "$state/logs"
+: > "$state/feat_gone.dbready"
+: > "$state/feat_gone.port"
+: > "$state/logs/feat_gone.log"
+
+# a dirty worktree is refused without --force
+echo scratch > "$wtdir/scratch.txt"
+assert_fails "rm: refuses a dirty worktree" "$WT" rm feat/gone
+assert_eq "0" "$(test -d "$wtdir" && echo 0 || echo 1)" "rm: dirty worktree survives the refusal"
+rm "$wtdir/scratch.txt"
+
+# unmerged commits are refused without --force
+( cd "$wtdir" && echo c > c.txt && git add c.txt && git commit -qm work )
+assert_fails "rm: refuses unmerged commits" "$WT" rm feat/gone
+
+# --force removes it and reclaims every state file
+"$WT" rm feat/gone --force >/dev/null 2>&1
+assert_eq "1" "$(test -d "$wtdir" && echo 0 || echo 1)"                    "rm --force: worktree gone"
+assert_eq "1" "$(test -f "$state/feat_gone.dbready" && echo 0 || echo 1)"  "rm --force: dbready cleared"
+assert_eq "1" "$(test -f "$state/feat_gone.port" && echo 0 || echo 1)"     "rm --force: port file cleared"
+assert_eq "1" "$(test -f "$state/logs/feat_gone.log" && echo 0 || echo 1)" "rm --force: log cleared"
+assert_missing "$(git -C "$REPO" branch --list 'feat/gone')" "feat/gone" \
+  "rm --force: branch deleted"
+
+# --keep-branch keeps the branch
+"$WT" new feat/keep >/dev/null 2>&1
+"$WT" rm feat/keep --force --keep-branch >/dev/null 2>&1
+assert_contains "$(git -C "$REPO" branch --list 'feat/keep')" "feat/keep" \
+  "rm --keep-branch: branch survives"
+
+# the primary checkout is never removable
+assert_fails "rm: refuses the primary checkout" "$WT" rm master --force
+
+# a clean, fully merged worktree needs no --force, but does need a yes
+"$WT" new feat/clean >/dev/null 2>&1
+printf 'y\n' | "$WT" rm feat/clean >/dev/null 2>&1
+assert_eq "1" "$(test -d "$TMP/rmrepo-worktrees/feat_clean" && echo 0 || echo 1)" \
+  "rm: clean merged worktree removed after confirmation"
+
+# answering no leaves everything alone
+"$WT" new feat/spared >/dev/null 2>&1
+printf 'n\n' | "$WT" rm feat/spared >/dev/null 2>&1 || true
+assert_eq "0" "$(test -d "$TMP/rmrepo-worktrees/feat_spared" && echo 0 || echo 1)" \
+  "rm: declining the prompt keeps the worktree"
+
 [ "$FAILED" = 0 ] || { echo "LIFECYCLE FAIL" >&2; exit 1; }
 echo "LIFECYCLE PASS"
