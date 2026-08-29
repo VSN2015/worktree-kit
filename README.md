@@ -274,8 +274,12 @@ Three levels, each a superset of the last:
   are deliberate — wt errs toward keeping data:
   **(a)** databases bootstrapped **before wt 0.2.0**, when `.dbowned` did not
   exist yet. On your first `wt rm` after upgrading, those report "no
-  ownership marker" and are left alone; drop them by hand, or run one
-  `wt reset <slug>` + `--own-db` cycle to re-bootstrap and re-mark them.
+  ownership marker" and are left alone. To reclaim one, drop the database by
+  hand and let the next `--own-db` run rebuild it: only the `db_bootstrap`
+  path writes `.dbowned`, and it runs only when the database is missing.
+  `wt reset` alone will not do it — it clears both markers, but the next
+  run then finds the database still there via `db_check` and re-adopts it,
+  which is case (b).
   **(b)** a database re-adopted after `wt reset`: `db_check` (which the rails
   templates configure) only ever writes `.dbready`, so the database that
   `db_check` finds on the next run is never re-marked as owned.

@@ -1,9 +1,10 @@
 # Worktree lifecycle commands for `wt`
 
-**Status:** implemented in worktree-kit 0.2.0. Three places where the
+**Status:** implemented in worktree-kit 0.2.0. Four places where the
 implementation deliberately diverged are marked inline below as RESOLVED
-DEVIATION (§6.3 hyphen folding, §10.1 step 5 ownership marker, §10.2 merge
-teardown); this document is otherwise the binding design.
+DEVIATION (§6.3 hyphen folding, §10.1 step 5 ownership marker, §10.1 step 7
+marker cleanup, §10.2 merge teardown); this document is otherwise the
+binding design.
 **Date:** 2026-08-29
 **Base commit:** `fbdf060` (worktree-kit 0.1.8)
 
@@ -282,7 +283,18 @@ Order, each step skipped with a note when it does not apply:
    > and are left in place with a notice; and a database re-adopted via
    > `db_check` after a `wt reset` is likewise never dropped.
 6. Flush the Redis slot `{n}`.
-7. Remove `wt-state/<slug>.pid`, `.port`, `.dbready`, and `logs/<slug>.log`.
+7. Remove `wt-state/<slug>.pid`, `.port`, `.dbready`, `.dbowned`, and
+   `logs/<slug>.log`.
+
+   > **RESOLVED DEVIATION (implementation, 2026-08-29).** This step
+   > originally listed four files; the implementation removes `.dbowned`
+   > too, which did not exist when the step was written (see step 5). It
+   > must: leaving an ownership marker behind for a slug whose database has
+   > just been dropped would hand that claim to whatever database next
+   > occupied the name, and `wt rm`/`wt merge` would then drop a database
+   > the kit never created. `wt reset` clears both markers for the same
+   > reason.
+
 8. `git worktree remove <path>`, then `git branch -d <branch>` unless
    `--keep-branch`. `-d`, not `-D`: an unmerged branch refuses removal.
    `--force` upgrades to `-D`.
