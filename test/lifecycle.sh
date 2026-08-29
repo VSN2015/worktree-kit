@@ -477,5 +477,43 @@ cwdrepo_repo="$REPO"
 out="$( (cd "$wtdir_incwd" && "$WT" merge feat/incwd 2>/dev/null) || true )"
 assert_eq "$cwdrepo_repo" "$out" "merge: from inside the worktree, prints the primary for cd"
 
+# ---------- Task 6: doctor ----------
+
+new_repo doctorrepo
+out="$("$WT" doctor 2>&1)"
+assert_contains "$out" "wt path:" "doctor: reports the path template"
+assert_contains "$out" "fzf:"     "doctor: reports fzf availability"
+assert_contains "$out" "shell:"   "doctor: reports shell integration state"
+
+out="$(WT_SHELL_INTEGRATION=1 "$WT" doctor 2>&1)"
+assert_contains "$out" "integration active" "doctor: detects an active wrapper"
+
+# The two template warnings need a YAML backend to read the .local file, AND
+# a main worktree-kit.yml to exist — load_config_soft gates on $CONFIG (the
+# non-local file), not $LOCAL_CONFIG, so with only the .local file present
+# HAS_CONFIG stays 0 and path_template() never consults either file. runner:
+# host is mandatory here (not compose) — require_config would otherwise
+# demand docker, which is not running in this environment.
+if command -v yq >/dev/null 2>&1 || command -v ruby >/dev/null 2>&1 \
+   || python3 -c 'import yaml' >/dev/null 2>&1; then
+  printf 'runner: host\nhooks:\n  server: "true"\n' > worktree-kit.yml
+  cat > worktree-kit.local.yml <<'YML'
+worktrees:
+  path: "{parent}/{repo}-worktrees/fixed"
+YML
+  out="$("$WT" doctor 2>&1)"
+  assert_contains "$out" "not branch-unique" "doctor: warns on a non-branch-unique template"
+
+  cat > worktree-kit.local.yml <<'YML'
+worktrees:
+  path: "{parent}/has space/{branch}"
+YML
+  out="$("$WT" doctor 2>&1)"
+  assert_contains "$out" "space" "doctor: warns on a template that yields a space"
+  rm -f worktree-kit.local.yml worktree-kit.yml
+else
+  ok "doctor: template warnings skipped (no YAML backend installed)"
+fi
+
 [ "$FAILED" = 0 ] || { echo "LIFECYCLE FAIL" >&2; exit 1; }
 echo "LIFECYCLE PASS"

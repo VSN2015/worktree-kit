@@ -13,7 +13,7 @@
 # docker compose only for `runner: compose` repos.
 set -eu
 
-WT_VERSION="0.1.8"
+WT_VERSION="0.2.0"
 
 die() { echo "wt: $*" >&2; exit 1; }
 note() { echo "wt: $*" >&2; }
@@ -796,6 +796,18 @@ cmd_doctor() {
   echo "primary:   $PRIMARY"
   echo "worktree:  $WT_PATH (slug: $SLUG, n: $N)"
   if [ -f "$CONFIG" ]; then require_config; echo "config:    $CONFIG (runner: $RUNNER, cache: $WT_CFG_SRC)"; else echo "config:    MISSING — run wt init"; fi
+  load_config_soft
+  _tmpl="$(path_template)"
+  echo "wt path:   $_tmpl"
+  _last="${_tmpl##*/}"
+  case "$_last" in
+    *'{branch}'*|*'{branch_raw}'*) ;;
+    *) echo "WARN: worktrees.path's last segment is not branch-unique — every worktree would share a slug, and with it a port, redis slot, and database" ;;
+  esac
+  _probe="$(expand_path "$_tmpl" wt-doctor-probe)"
+  case "$_probe" in
+    *" "*) echo "WARN: worktrees.path expands to a path containing a space ($_probe) — wt new will refuse it" ;;
+  esac
   yaml_backend
   case "$YAML_BACKEND" in
     yq)     echo "yaml:      $(yq --version)" ;;
@@ -808,6 +820,26 @@ cmd_doctor() {
     for f in $(cd "$OVERLAY_DIR" && find . -type f | sed 's|^\./||'); do
       [ "$PRIMARY/$f" -nt "$OVERLAY_DIR/$f" ] && echo "STALE overlay: $f (source is newer — wt localize $f)"
     done
+  fi
+
+  if command -v fzf >/dev/null 2>&1; then
+    echo "fzf:       $(fzf --version 2>/dev/null | head -1)"
+  else
+    echo "fzf:       not installed (wt switch falls back to a numbered menu)"
+  fi
+
+  if [ -n "${WT_SHELL_INTEGRATION:-}" ]; then
+    echo "shell:     integration active"
+  else
+    _rc_found=""
+    for _rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.config/fish/config.fish"; do
+      if [ -f "$_rc" ] && grep -q 'wt shell-init' "$_rc" 2>/dev/null; then _rc_found="$_rc"; break; fi
+    done
+    if [ -n "$_rc_found" ]; then
+      echo "shell:     shell-init found in $_rc_found (open a new shell to activate)"
+    else
+      echo "shell:     unknown — no WT_SHELL_INTEGRATION set and no 'wt shell-init' in your rc files"
+    fi
   fi
   echo "ok"
 }

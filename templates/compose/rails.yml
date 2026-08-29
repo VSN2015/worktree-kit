@@ -16,6 +16,14 @@ version: 1        # schema marker; reserved, not read today
 runner: compose   # compose = one-off `docker compose run` containers on your
                   # already-running stack; host = plain processes
 
+# Where `wt new <branch>` puts a new worktree. The LAST path segment becomes
+# the slug — and the slug names the port, the redis db {n}, and the database.
+# Keep {branch} last. Personal layouts belong in worktree-kit.local.yml.
+worktrees:
+  path: "{parent}/{repo}-worktrees/{branch}"
+  # trunk: master     # optional; what `wt merge` merges into.
+                      # Default: origin/HEAD, then main, then master.
+
 compose:          # read only when runner: compose
   service: app    # docker-compose.yml service whose IMAGE runs your code
   workdir: /app   # where that image expects the checkout (copy from your
@@ -76,3 +84,11 @@ isolation:
   db_bootstrap: "SKIP_TEST_DATABASE=1 bundle exec rails db:create db:schema:load"
   # Dirs compared against the primary to auto-escalate a server to own_db.
   migration_paths: [db/migrate]
+  # db_drop (optional): destroys the per-worktree DB. `wt rm`/`wt merge` run
+  # it only when the .dbowned marker is set — i.e. this worktree's DB was
+  # bootstrapped by wt, not merely adopted (db_check found one already
+  # there), and `wt reset` hasn't since cleared that marker. Without this
+  # key wt prints the DB name and leaves it in place.
+  db_drop: "SKIP_TEST_DATABASE=1 bundle exec rails db:drop"
+  # redis_flush (optional): empties this worktree's redis db on `wt rm`/`wt merge`.
+  redis_flush: "redis-cli -h redis -n {n} flushdb"

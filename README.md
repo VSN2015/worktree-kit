@@ -12,7 +12,7 @@ server, port, and database.**
 [![runtime deps](https://img.shields.io/badge/runtime%20deps-none-2ea44f)](#install)
 [![license](https://img.shields.io/github/license/VSN2015/worktree-kit?color=blue)](LICENSE)
 
-[Install](#install) · [Setup](#per-repo-setup) · [Config](#config-reference) · [Commands](#daily-use) · [Stack guides](#stack-guide-rails-on-docker-compose) · [Caveats](#caveats)
+[Install](#install) · [Setup](#per-repo-setup) · [Config](#config-reference) · [Commands](#daily-use) · [Shell integration](#shell-integration) · [Stack guides](#stack-guide-rails-on-docker-compose) · [Caveats](#caveats)
 
 </div>
 
@@ -122,6 +122,10 @@ gracefully.
 version: 1              # schema version; reserved, not read today
 runner: compose         # compose | host — how commands run (default: compose)
 
+worktrees:
+  path: "{parent}/{repo}-worktrees/{branch}"   # last segment becomes the slug
+  # trunk: master                              # optional; what `wt merge` targets
+
 compose:                # read only when runner: compose
   service: app          # docker-compose.yml service whose image runs your code
   workdir: /app         # where that image expects the checkout
@@ -148,6 +152,8 @@ isolation:
   db_check: "bundle exec rails runner \"ActiveRecord::Base.connection.execute('SELECT 1 FROM schema_migrations LIMIT 1')\""
   db_bootstrap: "SKIP_TEST_DATABASE=1 bundle exec rails db:create db:schema:load"
   migration_paths: [db/migrate]
+  db_drop: "SKIP_TEST_DATABASE=1 bundle exec rails db:drop"
+  redis_flush: "redis-cli -h redis -n {n} flushdb"
 ```
 
 ### runner
@@ -161,6 +167,25 @@ isolation:
 - **`host`** — plain processes on your machine, started in the worktree
   directory with the isolation env vars exported. `wt server` daemonizes with
   nohup and tracks a pidfile under `.git/wt-state/`.
+
+### worktrees.path / worktrees.trunk
+
+- **`path`** (default `{parent}/{repo}-worktrees/{branch}`) — where
+  `wt new <branch>` creates the worktree. **The last path segment becomes
+  the slug**, and the slug names the port, the Redis `{n}` slot, and the
+  `wt_{slug}` database — so keep `{branch}` (or `{branch_raw}`) last. A
+  template whose last segment isn't branch-unique (a fixed literal, say)
+  makes every worktree share one slug, and with it one port, one Redis DB,
+  and one database; `wt doctor` warns when it detects this. The expanded
+  path also can't contain a space — `wt`'s compose args and host env lists
+  are built by word-splitting, so `wt new` refuses such a path and
+  `wt doctor` warns about it too. `worktrees.path` is the natural key to
+  override per user in `worktree-kit.local.yml` — everyone shares the
+  repo's stack config but can keep worktrees under their own preferred
+  directory.
+- **`trunk`** (default: `origin/HEAD`, then `main`, then `master`) — the
+  branch `wt merge` merges into, and the branch `wt rm` checks a branch is
+  fully merged against before removing it without `--force`.
 
 ### compose.service / compose.workdir
 
@@ -230,6 +255,14 @@ Three levels, each a superset of the last:
   checkout. If the worktree has files the primary lacks (i.e. new
   migrations), `wt server` auto-escalates that worktree to `own_db`, because
   migrating the shared DB would break every other branch.
+- **`db_drop`** (optional) — destroys the per-worktree database. `wt rm` and
+  `wt merge` run it only when the worktree's database carries a `.dbowned`
+  marker — i.e. `db_bootstrap` created it, as opposed to `db_check` merely
+  finding one that already existed, and `wt reset` hasn't cleared that
+  marker since. Without `db_drop` configured (or when the database was only
+  adopted), wt prints the database name and leaves it in place.
+- **`redis_flush`** (optional) — empties this worktree's Redis DB `{n}` on
+  `wt rm` / `wt merge`. Without it, the DB is left as-is.
 
 > [!IMPORTANT]
 > **wt only exports env vars — your app config must read them.** Nothing
@@ -391,6 +424,36 @@ Two consequences of how slugs work:
 - The worktree itself carries no config; running `wt` from the primary
   checkout also works and is always treated as `shared`.
 
+## Shell integration
+
+`wt switch`, `wt new`, `wt rm`, and `wt merge` can all change which worktree
+you're standing in — but a subprocess can never `cd` its parent shell, so wt
+prints the target path on stdout (the "cd channel") and leaves the actual
+`cd` to your shell. Wire that up once:
+
+```sh
+eval "$(wt shell-init zsh)"      # or: bash, fish
+```
+
+Add that line to `~/.zshrc` (or `~/.bashrc`, or fish's `config.fish`) and
+open a new shell. It defines a `wt` shell function that intercepts `switch`,
+`new`, `rm`, and `merge` — running the real binary with
+`WT_SHELL_INTEGRATION=1` set (so `wt doctor` can report it as active) and
+`cd`-ing to whatever path it printed. Every other subcommand passes straight
+through to the real `wt`.
+
+Without it, those four commands still do everything else they normally do —
+they just print the path instead of changing directory:
+
+```sh
+$ wt switch feat/login
+/Users/you/code/myapp-worktrees/feat_login
+wt: not cd'd — install shell integration: eval "$(wt shell-init zsh)"
+```
+
+so `cd "$(wt switch feat/login)"` works too, if you'd rather not install the
+function.
+
 ## Daily use
 
 Every command takes its context from the directory you run it in: `wt`
@@ -411,8 +474,14 @@ running.
 | `wt logs [slug]`                        | follow a server's logs                              |
 | `wt localize <file...>`                 | snapshot a personal overlay (`--list` / `--remove`) |
 | `wt reset [slug]`                       | clear the own-db bootstrap marker                   |
+| `wt new <branch> [--from <base>] [--server]` | create a branch + worktree                     |
+| `wt switch [<branch>]`                  | cd to a worktree; no argument opens a picker        |
+| `wt rm [<branch>] [--keep-branch] [--force]` | tear down and remove a worktree                |
+| `wt merge [<branch>] [--into <trunk>] [-m <msg>] [--no-remove] [--force]` | squash, rebase, fast-forward trunk, then tear down |
+| `wt list [--all]`                       | list worktrees (branch, slug, status, server, isolation) |
 | `wt init`                               | write `worktree-kit.yml` from a stack template      |
 | `wt doctor`                             | environment + config checks                         |
+| `wt shell-init [bash\|zsh\|fish]`       | emit the shell function that makes `switch`/`new`/`rm`/`merge` cd |
 
 The isolation flags `--shared` / `--isolated` / `--own-db` work on `run`,
 `server`, and `up`; the [isolation](#isolation) section above covers what
@@ -559,13 +628,101 @@ Clears the marker that records "this worktree's database was bootstrapped",
 so the next `--own-db` run bootstraps again. It only clears the marker — the
 `wt_<slug>` database itself is never dropped; that's yours.
 
+### wt new — create a branch + worktree
+
+```sh
+wt new <branch> [--from <base>] [--server]
+```
+
+Creates the branch (or adopts an existing one of the same name) and a
+`git worktree add` at `worktrees.path`, runs `hooks.prepare` once, and prints
+the new worktree's path on the cd channel (see
+[Shell integration](#shell-integration)). `--from <base>` branches off
+`<base>` instead of `HEAD`; `--server` starts the server immediately instead
+(it runs `prepare` itself, so plain `wt new` doesn't also run it, to avoid
+running the hook twice).
+
+```sh
+wt new feat/login                    # new branch + worktree off HEAD
+wt new feat/login --from origin/main # off a specific base
+wt new feat/login --server           # + start its server right away
+```
+
+### wt switch — jump to a worktree
+
+```sh
+wt switch [<branch>]
+```
+
+Prints the worktree path for `<branch>` on the cd channel — or, with no
+argument, opens an interactive picker (`fzf` if installed, else a numbered
+menu) over every worktree, with a preview pane showing recent log and
+status. Needs [shell integration](#shell-integration) to actually `cd`;
+without it, `wt switch` just prints the path.
+
+### wt rm — tear down a worktree
+
+```sh
+wt rm [<branch>] [--keep-branch] [--force]
+```
+
+Stops the worktree's server, drops its database via `isolation.db_drop` —
+but only when the database carries a `.dbowned` marker, meaning wt itself
+bootstrapped it rather than merely adopting one `db_check` found already
+there (`wt reset` clears that marker, so an adopted-after-reset database is
+left in place with a notice instead) — flushes its Redis slot if
+`isolation.redis_flush` is configured, then removes the git worktree and
+deletes the branch. Defaults to the branch checked out in the current
+worktree. Prompts for confirmation, and refuses when the worktree is dirty
+or has commits not yet in the [trunk](#worktreespath--worktreestrunk);
+`--force` waives both the safety checks and the confirmation prompt.
+`--keep-branch` removes the worktree but leaves the branch.
+
+### wt merge — squash, rebase, fast-forward, tear down
+
+```sh
+wt merge [<branch>] [--into <trunk>] [-m <msg>] [--no-remove] [--force]
+```
+
+Squashes every commit on `<branch>` since it diverged from the
+[trunk](#worktreespath--worktreestrunk) into one commit, rebases that commit
+onto the trunk, fast-forwards the trunk to it in the primary checkout, then
+tears the worktree down exactly like `wt rm` does — **without prompting**. A
+backup ref (`refs/wt/premerge/<slug>`) captures the branch's pre-squash HEAD
+before anything is rewritten; a squash failure, a rebase conflict, or a
+non-fast-forward trunk all restore the branch to that commit and leave the
+worktree in place, with the recovery command printed. `--into <trunk>`
+overrides `worktrees.trunk` for this run; `-m <msg>` sets the squash commit
+message (default: the first commit's subject, remaining subjects as the
+body); `--no-remove` merges without tearing down.
+
+> [!IMPORTANT]
+> `wt merge` never prompts — there is nothing for `--force` to skip there.
+> Its `--force` only waives the one guard that exists: refusing to squash a
+> branch that has an upstream (squashing would rewrite already-published
+> history). This is different from `wt rm --force`, which waives both the
+> safety refusals *and* the confirmation prompt.
+
+### wt list — see every worktree
+
+```sh
+wt list [--all]
+```
+
+A table of every worktree: branch, slug, git status (`clean`/`dirty`),
+running server (if any), isolation level, and path. `--all` also lists
+branches that have no worktree.
+
 ### wt init / wt doctor — setup and checks
 
 `wt init` detects the stack and writes `worktree-kit.yml` (see
 [Per-repo setup](#per-repo-setup)). `wt doctor` prints the version, primary
-and worktree paths with slug and `{n}`, the config and runner in use, which
-YAML backend was auto-detected, whether docker is up (compose repos), and
-flags stale overlays. Run it after any config change.
+and worktree paths with slug and `{n}`, the config and runner in use, the
+resolved `worktrees.path` template (warning if its last segment isn't
+branch-unique, or if it expands to a path containing a space), which YAML
+backend was auto-detected, whether docker is up (compose repos), whether
+`fzf` is installed, whether shell integration is active, and flags stale
+overlays. Run it after any config change.
 
 ## Overlays (`wt localize`)
 

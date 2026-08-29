@@ -11,6 +11,14 @@
 version: 1     # schema marker; reserved, not read today
 runner: host   # plain processes in the worktree dir with the isolation env exported
 
+# Where `wt new <branch>` puts a new worktree. The LAST path segment becomes
+# the slug — and the slug names the port, the redis db {n}, and the database.
+# Keep {branch} last. Personal layouts belong in worktree-kit.local.yml.
+worktrees:
+  path: "{parent}/{repo}-worktrees/{branch}"
+  # trunk: master     # optional; what `wt merge` merges into.
+                      # Default: origin/HEAD, then main, then master.
+
 hooks:
   # prepare: runs before EVERY wt run / wt server — idempotent dependency self-heal.
   prepare: "pip install -q -r requirements.txt"
@@ -41,3 +49,11 @@ isolation:
   db_bootstrap: "python manage.py migrate"
   # Dirs compared against the primary to auto-escalate a server to own_db.
   migration_paths: ["*/migrations"]
+  # db_drop (optional): destroys the per-worktree DB. `wt rm`/`wt merge` run
+  # it only when the .dbowned marker is set — i.e. this worktree's DB was
+  # bootstrapped by wt, not merely adopted (db_check found one already
+  # there), and `wt reset` hasn't since cleared that marker. Without this
+  # key wt prints the DB name and leaves it in place.
+  db_drop: "dropdb --if-exists wt_{slug}"
+  # redis_flush (optional): empties this worktree's redis db on `wt rm`/`wt merge`.
+  redis_flush: "redis-cli -n {n} flushdb"
