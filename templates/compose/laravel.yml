@@ -68,4 +68,7 @@ isolation:
   # key wt prints the DB name and leaves it in place.
   db_drop: "php artisan db:wipe --force"
   # redis_flush (optional): empties this worktree's redis db on `wt rm`/`wt merge`.
+  # Host assumed as "redis" — this template exports REDIS_DB, not a REDIS_URL,
+  # so there's no host to read here; adjust if your compose redis service has
+  # a different name.
   redis_flush: "redis-cli -h redis -n {n} flushdb"

@@ -60,8 +60,11 @@ isolation:
   # it only when the .dbowned marker is set — i.e. this worktree's DB was
   # bootstrapped by wt, not merely adopted (db_check found one already
   # there), and `wt reset` hasn't since cleared that marker. Without this
-  # key wt prints the DB name and leaves it in place. -h/-U shown for
-  # postgres (host = your compose db service); adjust for your engine.
-  db_drop: "psql -h db -U postgres -c 'DROP DATABASE IF EXISTS wt_{slug}'"
+  # key wt prints the DB name and leaves it in place. Left commented out:
+  # Django reads its DB connection from settings.py, which this file never
+  # sees, so wt has no host/user/engine to connect with — guessing one would
+  # risk a DROP DATABASE against the wrong server. Fill in your real
+  # connection before enabling, e.g.:
+  # db_drop: "psql -h <your-db-host> -U <your-db-user> -c 'DROP DATABASE IF EXISTS wt_{slug}'"
   # redis_flush (optional): empties this worktree's redis db on `wt rm`/`wt merge`.
   redis_flush: "redis-cli -h redis -n {n} flushdb"

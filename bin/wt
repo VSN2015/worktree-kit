@@ -1198,7 +1198,7 @@ wt — worktree-aware runner (config: worktree-kit.yml at the primary checkout)
   wt list [--all]        list worktrees (branch, slug, status, server, isolation)
   wt init                write worktree-kit.yml from a stack template
   wt doctor              environment + config checks
-  wt shell-init [bash|zsh|fish]   emit the shell function that makes switch cd
+  wt shell-init [bash|zsh|fish]   emit the shell function that makes switch/new/rm/merge cd
 EOF
 }
 

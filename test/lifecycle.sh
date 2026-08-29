@@ -509,7 +509,11 @@ worktrees:
   path: "{parent}/has space/{branch}"
 YML
   out="$("$WT" doctor 2>&1)"
-  assert_contains "$out" "space" "doctor: warns on a template that yields a space"
+  # Not "space" alone: the unconditional "wt path:" line above already
+  # echoes the raw template, which contains "has space" from the fixture's
+  # own directory name — that substring would match whether or not the WARN
+  # line fires. Assert on text only the WARN line itself can produce.
+  assert_contains "$out" "wt new will refuse it" "doctor: warns on a template that yields a space"
   rm -f worktree-kit.local.yml worktree-kit.yml
 else
   ok "doctor: template warnings skipped (no YAML backend installed)"
