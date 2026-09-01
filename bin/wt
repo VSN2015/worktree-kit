@@ -25,7 +25,7 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
 # the NEW cwd there, so pin the absolute path once, before any cd.
 case "$0" in
   /*)  WT_BIN="$0" ;;
-  */*) WT_BIN="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
+  */*) WT_BIN="$(CDPATH= cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
   *)   WT_BIN="$(command -v "$0" 2>/dev/null || echo "$0")" ;;
 esac
 

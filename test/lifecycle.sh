@@ -9,11 +9,14 @@ set -eu
 # the wrong code. The tests cd into temp repos, so a relative WT (ours or a
 # caller's WT=./bin/wt) must become absolute before the first cd.
 if [ -z "${WT:-}" ]; then
-  WT="$(cd "$(dirname "$0")/.." && pwd)/bin/wt"
-  [ -x "$WT" ] || WT=wt
+  WT="$(CDPATH= cd "$(dirname "$0")/.." && pwd)/bin/wt"
+  if ! [ -x "$WT" ]; then
+    echo "WARNING: $WT is not executable — falling back to \`wt\` from PATH" >&2
+    WT=wt
+  fi
 fi
 case "$WT" in
-  */*) WT="$(cd "$(dirname "$WT")" && pwd)/$(basename "$WT")" ;;
+  */*) WT="$(CDPATH= cd "$(dirname "$WT")" && pwd)/$(basename "$WT")" ;;
 esac
 TMP="$(mktemp -d)"
 # Canonicalize: on macOS $TMPDIR lives under a symlink (/var -> /private/var),
@@ -783,7 +786,9 @@ fi
 new_repo relwtrepo
 if have_yaml; then
   mkdir -p localbin
-  cp "$WT" localbin/wt
+  # $WT can be a bare PATH name (explicit WT=wt, or the exec-bit fallback);
+  # cp does not search PATH, so resolve it first or set -eu aborts silently.
+  cp "$(command -v "$WT" || echo "$WT")" localbin/wt
   chmod +x localbin/wt
   printf 'runner: host\nhooks:\n  prepare: "touch .prepared"\n  server: "true"\n' \
     > worktree-kit.yml
