@@ -19,6 +19,16 @@ die() { echo "wt: $*" >&2; exit 1; }
 note() { echo "wt: $*" >&2; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
 
+# wt re-invokes itself from subshells that have cd'd elsewhere (cmd_new's
+# prepare, cmd_up, teardown's server stop — and cmd_rm cds the whole process
+# to $PRIMARY before teardown). A relative $0 (./bin/wt) resolves against
+# the NEW cwd there, so pin the absolute path once, before any cd.
+case "$0" in
+  /*)  WT_BIN="$0" ;;
+  */*) WT_BIN="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
+  *)   WT_BIN="$(command -v "$0" 2>/dev/null || echo "$0")" ;;
+esac
+
 # ---------- context ----------
 
 hashnum() { printf '%s' "$1" | cksum | cut -d' ' -f1; }
@@ -434,7 +444,7 @@ teardown_worktree() { # <slug> <path>
   _ts="$1"; _tp="$2"
 
   if [ "${HAS_CONFIG:-0}" = 1 ]; then
-    "$0" down "$_ts" >&2 || note "could not stop the server for $_ts — check for a stray process"
+    "$WT_BIN" down "$_ts" >&2 || note "could not stop the server for $_ts — check for a stray process"
 
     # expand() reads the globals SLUG and N, and runner_exec reads WT_PATH
     # (host: `cd "$WT_PATH"`; compose: `-v $WT_PATH:$WORKDIR`). Borrow all
@@ -736,7 +746,7 @@ cmd_up() {
     if [ $# -gt 0 ]; then
       echo " $* " | grep -q " $s " || continue
     fi
-    ( cd "$p" && "$0" server $LEVEL ) || note "failed to start $s"
+    ( cd "$p" && "$WT_BIN" server $LEVEL ) || note "failed to start $s"
   done
 }
 
@@ -821,7 +831,7 @@ cmd_reset() {
 cmd_init() {
   [ -f "$CONFIG" ] && die "worktree-kit.yml already exists at $PRIMARY"
   # resolve symlink chains; relative targets (Homebrew, npm) resolve against the link's dir
-  self="$0"
+  self="$WT_BIN"
   while [ -L "$self" ]; do
     link="$(readlink "$self")"
     case "$link" in /*) self="$link" ;; *) self="$(dirname "$self")/$link" ;; esac
@@ -847,8 +857,15 @@ cmd_doctor() {
   echo "wt $WT_VERSION"
   echo "primary:   $PRIMARY"
   echo "worktree:  $WT_PATH (slug: $SLUG, n: $N)"
-  if [ -f "$CONFIG" ]; then require_config; echo "config:    $CONFIG (runner: $RUNNER, cache: $WT_CFG_SRC)"; else echo "config:    MISSING — run wt init"; fi
+  # load_config_soft, not require_config: doctor diagnoses a missing docker
+  # CLI below — require_config's `need docker` would die on it right here,
+  # before a single check has printed.
   load_config_soft
+  if [ "$HAS_CONFIG" = 1 ]; then
+    echo "config:    $CONFIG (runner: $RUNNER, cache: $WT_CFG_SRC)"
+  else
+    echo "config:    MISSING — run wt init"
+  fi
   _tmpl="$(path_template)"
   echo "wt path:   $_tmpl"
   _last="${_tmpl##*/}"
@@ -867,7 +884,15 @@ cmd_doctor() {
     python) echo "yaml:      python3 + PyYAML (yq not needed)" ;;
     '')     echo "yaml:      NONE — ok while the config cache is fresh; config edits need yq, ruby, or python3+PyYAML" ;;
   esac
-  [ "${RUNNER:-compose}" = compose ] && { docker info >/dev/null 2>&1 && echo "docker:    up" || echo "docker:    DOWN"; }
+  if [ "${RUNNER:-compose}" = compose ]; then
+    if ! command -v docker >/dev/null 2>&1; then
+      echo "docker:    MISSING — install docker for runner: compose"
+    elif docker info >/dev/null 2>&1; then
+      echo "docker:    up"
+    else
+      echo "docker:    DOWN"
+    fi
+  fi
   if [ -d "$OVERLAY_DIR" ]; then
     for f in $(cd "$OVERLAY_DIR" && find . -type f | sed 's|^\./||'); do
       [ "$PRIMARY/$f" -nt "$OVERLAY_DIR/$f" ] && echo "STALE overlay: $f (source is newer — wt localize $f)"
@@ -945,14 +970,14 @@ worktree paths must be space-free. Change worktrees.path or the branch name." ;;
   # once the server path also fires it.
   if [ "$_start_server" = 0 ] && [ "$HAS_CONFIG" = 1 ] && [ -n "${PREPARE:-}" ]; then
     note "prepare: $PREPARE"
-    if ! ( cd "$_path" && "$0" run --shared -- true ) >&2; then
+    if ! ( cd "$_path" && "$WT_BIN" run --shared -- true ) >&2; then
       die "prepare hook failed — worktree left at $_path"
     fi
   fi
 
   if [ "$_start_server" = 1 ]; then
     if [ "$HAS_CONFIG" = 0 ]; then die "--server needs worktree-kit.yml — run 'wt init'"; fi
-    ( cd "$_path" && "$0" server ) >&2 || die "server failed to start in $_path"
+    ( cd "$_path" && "$WT_BIN" server ) >&2 || die "server failed to start in $_path"
   fi
 
   emit_cd "$_path"

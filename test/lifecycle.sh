@@ -4,7 +4,17 @@
 # Or from a linux suite:   sh /src/test/lifecycle.sh
 set -eu
 
-WT="${WT:-wt}"
+# Default to this repo's bin/wt, not whatever `wt` is on PATH — "run
+# directly" must test the checkout, and an installed wt would silently test
+# the wrong code. The tests cd into temp repos, so a relative WT (ours or a
+# caller's WT=./bin/wt) must become absolute before the first cd.
+if [ -z "${WT:-}" ]; then
+  WT="$(cd "$(dirname "$0")/.." && pwd)/bin/wt"
+  [ -x "$WT" ] || WT=wt
+fi
+case "$WT" in
+  */*) WT="$(cd "$(dirname "$WT")" && pwd)/$(basename "$WT")" ;;
+esac
 TMP="$(mktemp -d)"
 # Canonicalize: on macOS $TMPDIR lives under a symlink (/var -> /private/var),
 # but git resolves absolute paths, so exact-path assertions below would
@@ -761,6 +771,53 @@ else
   ok "worktrees.path: a committed (non-.local) template drives the created path (skipped: no YAML backend)"
   ok "worktrees.path: the committed template's directory is the one created (skipped: no YAML backend)"
   ok "worktrees.path: the slug follows the committed template's last segment (skipped: no YAML backend)"
+fi
+
+# ---------- review fixes: relative invocation and doctor without docker ----------
+
+# wt re-invokes itself as "$0" from subshells that have cd'd elsewhere
+# (cmd_new's prepare, cmd_up, teardown's server stop). Invoked as ./bin/wt,
+# $0 is relative and resolves against the NEW cwd, where it does not exist —
+# the prepare hook then fails and wt new aborts. Reproduce the exact shape:
+# a copy of wt reached by a relative path from the repo root.
+new_repo relwtrepo
+if have_yaml; then
+  mkdir -p localbin
+  cp "$WT" localbin/wt
+  chmod +x localbin/wt
+  printf 'runner: host\nhooks:\n  prepare: "touch .prepared"\n  server: "true"\n' \
+    > worktree-kit.yml
+  if out="$(./localbin/wt new feat/relative 2>&1 >/dev/null)"; then
+    ok "relative \$0: wt new survives a relative invocation"
+  else
+    fail "relative \$0: wt new survives a relative invocation: $out"
+  fi
+  assert_eq "0" "$(test -f "$TMP/relwtrepo-worktrees/feat_relative/.prepared" && echo 0 || echo 1)" \
+    "relative \$0: the prepare hook ran in the new worktree"
+else
+  ok "relative \$0: wt new survives a relative invocation (skipped: no YAML backend)"
+  ok "relative \$0: the prepare hook ran in the new worktree (skipped: no YAML backend)"
+fi
+
+# wt doctor is the diagnostic command — it must report a missing docker CLI,
+# not die on require_config's `need docker` before printing a single check.
+# Default runner (compose) with docker absent from PATH is the trigger.
+new_repo doctornodocker
+if have_yaml; then
+  printf 'hooks:\n  server: "true"\n' > worktree-kit.yml
+  if out="$(PATH="$NODOCKER_PATH" "$WT" doctor 2>&1)"; then
+    ok "doctor: exits zero with a compose config and no docker on PATH"
+  else
+    fail "doctor: exits zero with a compose config and no docker on PATH: $out"
+  fi
+  assert_contains "$out" "install docker" \
+    "doctor: reports a missing docker CLI instead of dying"
+  assert_contains "$out" "fzf:" \
+    "doctor: checks past the docker line still run without docker"
+else
+  ok "doctor: exits zero with a compose config and no docker on PATH (skipped: no YAML backend)"
+  ok "doctor: reports a missing docker CLI instead of dying (skipped: no YAML backend)"
+  ok "doctor: checks past the docker line still run without docker (skipped: no YAML backend)"
 fi
 
 [ "$FAILED" = 0 ] || { echo "LIFECYCLE FAIL" >&2; exit 1; }
