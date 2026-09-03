@@ -29,6 +29,11 @@ volumes:
   - name: "{project}_wt_gomod"
     path: /go/pkg/mod
 
+# Gitignored paths symlinked from the primary checkout into every worktree:
+# personal tooling folders (a repo-local .claude/) that only the primary has.
+# `wt new` creates the links, `wt link` repairs them.
+# links: [.claude]
+
 hooks:
   # server: must bind 0.0.0.0 and listen on {container_port};
   # wt publishes {port}:{container_port} per worktree.

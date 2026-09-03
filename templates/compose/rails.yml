@@ -43,6 +43,11 @@ volumes:
 mounts:
   read_only: [node_modules]
 
+# Gitignored paths symlinked from the primary checkout into every worktree:
+# personal tooling folders (a repo-local .claude/) that only the primary has.
+# `wt new` creates the links, `wt link` repairs them.
+# links: [.claude]
+
 hooks:
   # prepare: runs before EVERY wt run / wt server — an idempotent dependency
   # self-heal, near-instant when there is nothing to do.

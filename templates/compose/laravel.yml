@@ -28,6 +28,11 @@ compose:
                            # (Sail's default service is "laravel.test")
   workdir: /var/www/html   # where that image expects the checkout
 
+# Gitignored paths symlinked from the primary checkout into every worktree:
+# personal tooling folders (a repo-local .claude/) that only the primary has.
+# `wt new` creates the links, `wt link` repairs them.
+# links: [.claude]
+
 hooks:
   # prepare: runs before EVERY wt run / wt server — idempotent dependency self-heal.
   prepare: "composer install --quiet"

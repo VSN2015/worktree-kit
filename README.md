@@ -137,6 +137,8 @@ volumes:                # named docker volumes added to every wt container
 mounts:
   read_only: [node_modules]   # dirs mounted read-only from the primary checkout
 
+links: [.claude]        # gitignored paths symlinked from the primary into every worktree
+
 hooks:
   prepare: "bundle check >/dev/null 2>&1 || bundle install --jobs=4 --retry=3"
   build: "yarn build"
@@ -221,6 +223,21 @@ worktree's container — dependency dirs you don't want to reinstall per
 worktree (e.g. `node_modules`). Read-only means `yarn build` works but
 `yarn install` fails loudly instead of corrupting the shared copy; install
 new deps from the primary checkout.
+
+### links
+
+Paths in the **primary** checkout symlinked into every worktree — for
+personal folders that git ignores and that therefore exist only in the
+primary, such as a repo-local `.claude/` holding Claude Code skills, rules
+and hooks. `wt new` creates the links, `wt link` creates or repairs them in
+existing worktrees, and `wt doctor` reports a worktree that is missing one.
+Nothing already at the destination is ever removed or replaced.
+
+A gitignore rule with a trailing slash (`.claude/`) matches directories
+only, so git shows the symlink as untracked (`?? .claude`). When that
+happens wt appends the anchored path (`/.claude`) to `.git/info/exclude` —
+shared by every worktree of the repo — and says so; the link then shows as
+ignored (`!! .claude`) everywhere.
 
 ### hooks
 
@@ -495,6 +512,7 @@ running.
 | `wt ps`                                 | list running worktree servers                       |
 | `wt logs [slug]`                        | follow a server's logs                              |
 | `wt localize <file...>`                 | snapshot a personal overlay (`--list` / `--remove`) |
+| `wt link [--all \| slug...]`            | symlink `links:` paths from the primary into worktrees |
 | `wt reset [slug]`                       | clear the own-db bootstrap marker                   |
 | `wt new <branch> [--from <base>] [--server]` | create a branch + worktree                     |
 | `wt switch [<branch>]`                  | cd to a worktree; no argument opens a picker        |
@@ -639,6 +657,20 @@ wt localize --remove config/database.yml      # drop an overlay
 
 Snapshots a tracked file into `.git/local/` to be mounted read-only over the
 container's copy — details in [Overlays](#overlays-wt-localize) below.
+
+### wt link — host-visible symlinks
+
+```sh
+wt link              # link this worktree (run inside it)
+wt link --all        # every worktree except the primary
+wt link feat_x       # only the named slugs
+```
+
+Symlinks each [`links:`](#links) path from the primary checkout into the
+worktree, so gitignored personal folders like `.claude/` exist there too.
+`localize` snapshots a file for containers; `link` symlinks a path for the
+host and auto-runs on `wt new`. An existing file or directory at the
+destination is reported and left alone, and a second run just reports `ok`.
 
 ### wt reset — re-bootstrap an own-db worktree
 

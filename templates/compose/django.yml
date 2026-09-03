@@ -23,6 +23,11 @@ compose:
   service: web    # your compose service whose IMAGE runs your code
   workdir: /app   # where that image expects the checkout
 
+# Gitignored paths symlinked from the primary checkout into every worktree:
+# personal tooling folders (a repo-local .claude/) that only the primary has.
+# `wt new` creates the links, `wt link` repairs them.
+# links: [.claude]
+
 hooks:
   # No prepare hook: pip deps live in the image's site-packages, which
   # one-off containers reset — rebuild the image when requirements change,

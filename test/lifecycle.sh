@@ -825,5 +825,147 @@ else
   ok "doctor: checks past the docker line still run without docker (skipped: no YAML backend)"
 fi
 
+# ---------- link ----------
+#
+# Personal folders that git ignores (a repo-local .claude/ with skills, rules
+# and hooks) exist only in the primary checkout; `links:` symlinks them into
+# every worktree. The primary's rule is ".claude/" WITH a trailing slash —
+# it matches directories only, so git reports the symlink as untracked until
+# wt adds "/.claude" to the shared .git/info/exclude. runner: host — compose
+# would make wt new demand docker.
+new_repo linkrepo
+if have_yaml; then
+  mkdir -p .claude/skills
+  echo skill > .claude/skills/one.md
+  printf '.claude/\n' > .gitignore
+  cat > worktree-kit.yml <<'YML'
+runner: host
+hooks:
+  server: "true"
+links: [.claude]
+YML
+  git add .gitignore worktree-kit.yml
+  git commit -qm 'link config'
+  linkrepo="$REPO"
+
+  # 1. wt link inside a worktree that git (not wt new) created — so nothing
+  # has linked it yet — creates the symlink with an absolute target.
+  wt1="$TMP/linkrepo-worktrees/manual"
+  git worktree add -q "$wt1" -b manual
+  assert_eq "1" "$(test -e "$wt1/.claude" && echo 0 || echo 1)" \
+    "link: a plain git worktree starts without .claude"
+  if out="$( (cd "$wt1" && "$WT" link 2>&1) )"; then
+    ok "link: exits 0 inside a worktree"
+  else
+    fail "link: exits 0 inside a worktree: $out"
+  fi
+  assert_eq "$linkrepo/.claude" "$(readlink "$wt1/.claude" || true)" \
+    "link: creates <wt>/.claude -> <primary>/.claude"
+  assert_eq "skill" "$(cat "$wt1/.claude/skills/one.md" 2>/dev/null || true)" \
+    "link: the primary's files are reachable through the link"
+
+  # 2. the symlink is ignored (!!), not untracked (??): wt added /.claude to
+  # .git/info/exclude because the dir-only rule did not cover it.
+  assert_contains "$out" "added /.claude to .git/info/exclude" \
+    "link: reports the exclude entry it added"
+  assert_eq "!! .claude" "$(git -C "$wt1" status --short --ignored .claude)" \
+    "link: the symlink is ignored, not untracked"
+
+  # 3. a second run is a no-op that says so, and never duplicates the entry
+  if out="$( (cd "$wt1" && "$WT" link 2>&1) )"; then
+    ok "link: a second run exits 0"
+  else
+    fail "link: a second run exits 0: $out"
+  fi
+  assert_contains "$out" "link: .claude ok" "link: a second run reports ok"
+  assert_missing "$out" "added /.claude" "link: a second run adds nothing to the exclude file"
+  assert_eq "1" "$(grep -cxF '/.claude' "$linkrepo/.git/info/exclude" || true)" \
+    "link: /.claude appears in .git/info/exclude exactly once after two runs"
+  assert_eq "$linkrepo/.claude" "$(readlink "$wt1/.claude" || true)" \
+    "link: a second run leaves the symlink as it was"
+
+  # 4. a real file at the destination is reported and left alone
+  wt2="$TMP/linkrepo-worktrees/occupied"
+  git worktree add -q "$wt2" -b occupied
+  echo keep > "$wt2/.claude"
+  if out="$( (cd "$wt2" && "$WT" link 2>&1) )"; then
+    ok "link: exits 0 when the destination is a real file"
+  else
+    fail "link: exits 0 when the destination is a real file: $out"
+  fi
+  assert_contains "$out" "SKIP" "link: reports SKIP for an occupied destination"
+  assert_eq "keep" "$(cat "$wt2/.claude")" "link: never overwrites an existing file"
+  assert_eq "1" "$(test -L "$wt2/.claude" && echo 0 || echo 1)" \
+    "link: the occupied path is still not a symlink"
+
+  # 5. wt new links automatically; stdout must stay the bare cd path
+  out="$("$WT" new feat/auto 2>/dev/null)" || fail "setup: wt new feat/auto"
+  wt3="$TMP/linkrepo-worktrees/feat_auto"
+  assert_eq "$wt3" "$out" "link: wt new stdout is still the bare path with links configured"
+  assert_eq "$linkrepo/.claude" "$(readlink "$wt3/.claude" || true)" \
+    "link: wt new links .claude without a manual wt link"
+
+  # 6. no argument in the primary is refused; --all covers every worktree
+  # except the primary; slugs narrow it like wt up
+  assert_fails "link: no argument in the primary is an error" "$WT" link
+  err="$("$WT" link 2>&1 >/dev/null || true)"
+  assert_contains "$err" "--all" "link: the primary refusal points at --all"
+
+  wt4="$TMP/linkrepo-worktrees/bulk"
+  git worktree add -q "$wt4" -b bulk
+  rm -f "$wt3/.claude"
+  if out="$("$WT" link --all 2>&1)"; then
+    ok "link --all: exits 0"
+  else
+    fail "link --all: exits 0: $out"
+  fi
+  assert_eq "$linkrepo/.claude" "$(readlink "$wt4/.claude" || true)" \
+    "link --all: links a worktree that had no link"
+  assert_eq "$linkrepo/.claude" "$(readlink "$wt3/.claude" || true)" \
+    "link --all: restores a removed link"
+  assert_eq "keep" "$(cat "$wt2/.claude")" "link --all: still leaves the occupied path alone"
+  assert_missing "$out" "$linkrepo/.claude exists" "link --all: skips the primary"
+
+  rm -f "$wt3/.claude" "$wt4/.claude"
+  wt_ok link bulk
+  assert_eq "$linkrepo/.claude" "$(readlink "$wt4/.claude" || true)" \
+    "link <slug>: links the named worktree"
+  assert_eq "1" "$(test -L "$wt3/.claude" && echo 0 || echo 1)" \
+    "link <slug>: leaves unnamed worktrees alone"
+  assert_fails "link: an unknown slug is an error" "$WT" link nosuch
+
+  # a worktree whose directory is gone (not yet pruned) must be skipped, not
+  # recreated as an empty directory holding a lone symlink
+  rm -rf "$wt4"
+  out="$("$WT" link --all 2>&1)" || fail "link --all with a stale worktree entry: $out"
+  assert_eq "1" "$(test -e "$wt4" && echo 0 || echo 1)" \
+    "link --all: does not recreate a deleted worktree directory"
+  assert_contains "$out" "prune" "link --all: points at git worktree prune for the stale entry"
+
+  # 7. doctor flags a worktree missing a configured link, and only there
+  rm -f "$wt3/.claude"
+  out="$( (cd "$wt3" && "$WT" doctor 2>&1) )" || fail "setup: wt doctor in an unlinked worktree"
+  assert_contains "$out" "MISSING link: .claude" "doctor: flags a worktree missing a configured link"
+  ( cd "$wt3" && "$WT" link >/dev/null 2>&1 ) || fail "setup: wt link in feat_auto"
+  out="$( (cd "$wt3" && "$WT" doctor 2>&1) )" || fail "setup: wt doctor in a linked worktree"
+  assert_missing "$out" "MISSING link" "doctor: quiet once the link exists"
+  out="$("$WT" doctor 2>&1)" || fail "setup: wt doctor in the primary"
+  assert_missing "$out" "MISSING link" "doctor: never flags the primary itself"
+
+  # 8. a config without links: is an error that names the key
+  new_repo nolinkrepo
+  printf 'runner: host\nhooks:\n  server: "true"\n' > worktree-kit.yml
+  git worktree add -q "$TMP/nolinkrepo-worktrees/plain" -b plain
+  assert_fails "link: fails without links: in the config" "$WT" link --all
+  err="$( (cd "$TMP/nolinkrepo-worktrees/plain" && "$WT" link 2>&1 >/dev/null) || true )"
+  assert_contains "$err" "no links:" "link: names the missing links: key"
+else
+  ok "link: config-driven tests skipped (no YAML backend installed)"
+fi
+
+# no config at all is an error too, and needs no YAML backend to prove
+new_repo noconfiglinkrepo
+assert_fails "link: fails without a worktree-kit.yml" "$WT" link --all
+
 [ "$FAILED" = 0 ] || { echo "LIFECYCLE FAIL" >&2; exit 1; }
 echo "LIFECYCLE PASS"

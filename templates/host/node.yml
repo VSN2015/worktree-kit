@@ -19,6 +19,11 @@ worktrees:
   # trunk: master     # optional; what `wt merge` merges into.
                       # Default: origin/HEAD, then main, then master.
 
+# Gitignored paths symlinked from the primary checkout into every worktree:
+# personal tooling folders (a repo-local .claude/) that only the primary has.
+# `wt new` creates the links, `wt link` repairs them.
+# links: [.claude]
+
 hooks:
   # prepare: runs before EVERY wt run / wt server — idempotent dependency self-heal.
   prepare: "npm ci --prefer-offline 2>/dev/null || npm install"

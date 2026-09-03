@@ -13,7 +13,7 @@
 # docker compose only for `runner: compose` repos.
 set -eu
 
-WT_VERSION="0.2.0"
+WT_VERSION="0.3.0"
 
 die() { echo "wt: $*" >&2; exit 1; }
 note() { echo "wt: $*" >&2; }
@@ -622,6 +622,56 @@ ensure_own_db() {
   touch "$marker" "$STATE_DIR/$SLUG.dbowned"
 }
 
+# ---------- links ----------
+
+# A gitignore rule with a trailing slash (".claude/") matches directories
+# only. The symlink wt creates is not one, so git reports it untracked in
+# every worktree until the path is excluded; info/exclude is shared by all
+# worktrees of the repo, so one anchored entry covers them all.
+exclude_link() { # <worktree-path> <path>
+  _rc=0
+  git -C "$1" check-ignore -q -- "$2" || _rc=$?
+  case "$_rc" in
+    0) return 0 ;;
+    1) ;;
+    *) note "link: $2 — git check-ignore failed (exit $_rc), exclude entry not checked"; return 0 ;;
+  esac
+  _ex="$GIT_COMMON/info/exclude"
+  mkdir -p "$GIT_COMMON/info"
+  if [ -f "$_ex" ] && grep -qxF "/$2" "$_ex"; then return 0; fi
+  # a hand-edited exclude file may lack its final newline
+  if [ -s "$_ex" ] && [ -n "$(tail -c1 "$_ex")" ]; then echo >> "$_ex"; fi
+  printf '/%s\n' "$2" >> "$_ex"
+  note "link: $2 — added /$2 to .git/info/exclude (the ignore rule matched dirs only)"
+}
+
+# Symlinks every `links:` path from the primary into the worktree at $1. The
+# target is absolute so the link resolves from any cwd. Nothing already at
+# the destination is removed or replaced; failures are noted and skipped so
+# one bad path never blocks the rest, or the wt new that called this.
+apply_links() { # <worktree-path>
+  for _lp in $(cfg_list links); do
+    [ -n "$_lp" ] || continue
+    _src="$PRIMARY/$_lp"; _dst="$1/$_lp"
+    if [ ! -e "$_src" ]; then
+      note "link: $_lp — not in primary, skipped"; continue
+    fi
+    if [ -L "$_dst" ] && [ "$(readlink "$_dst")" = "$_src" ]; then
+      note "link: $_lp ok"
+    elif [ -e "$_dst" ] || [ -L "$_dst" ]; then
+      note "link: $_lp SKIP — $_dst exists and is not a link to the primary"; continue
+    else
+      mkdir -p "$(dirname "$_dst")"
+      if ! ln -s "$_src" "$_dst"; then
+        note "link: $_lp — could not create $_dst"; continue
+      fi
+      note "link: $_lp -> $_src"
+    fi
+    exclude_link "$1" "$_lp"
+  done
+  true
+}
+
 # ---------- compose runner ----------
 
 compose_args() { # mounts + volumes + env for isolation level $1
@@ -822,6 +872,46 @@ cmd_localize() {
   done
 }
 
+cmd_link() {
+  # load_config_soft, not require_config: linking is git-only and must not
+  # demand docker for a compose repo.
+  load_config_soft
+  if [ "$HAS_CONFIG" = 0 ]; then die "no worktree-kit.yml at $PRIMARY — run 'wt init' in that repo"; fi
+  [ -n "$(cfg_list links)" ] || die "no links: in worktree-kit.yml"
+  if [ $# -eq 0 ]; then
+    if [ "$WT_PATH" = "$PRIMARY" ]; then
+      die "the primary is the link source — run from a worktree, or pass --all"
+    fi
+    apply_links "$WT_PATH"
+    return 0
+  fi
+  _all=0; _slugs=""
+  for _a in "$@"; do
+    case "$_a" in
+      --all) _all=1 ;;
+      -*)    die "unknown flag: $_a (wt link [--all | slug...])" ;;
+      *)     _slugs="$_slugs $_a" ;;
+    esac
+  done
+  if [ "$_all" = 1 ] && [ -n "$_slugs" ]; then die "usage: wt link [--all | slug...]"; fi
+  _hit=0
+  for _p in $(worktree_paths); do
+    [ "$_p" = "$PRIMARY" ] && continue
+    _s="$(slugify "$_p")"
+    if [ "$_all" = 0 ]; then
+      echo " $_slugs " | grep -q " $_s " || continue
+    fi
+    _hit=1
+    if [ ! -d "$_p" ]; then note "$_s: $_p is missing — run: git worktree prune"; continue; fi
+    note "$_s ($_p):"
+    apply_links "$_p"
+  done
+  if [ "$_hit" = 0 ]; then
+    if [ "$_all" = 1 ]; then note "no worktrees besides the primary — nothing to link"
+    else die "no worktree matches:$_slugs (see: wt list)"; fi
+  fi
+}
+
 cmd_reset() {
   s="${1:-$SLUG}"
   rm -f "$STATE_DIR/$s.dbready" "$STATE_DIR/$s.dbowned"
@@ -899,6 +989,14 @@ cmd_doctor() {
     done
   fi
 
+  if [ "$WT_PATH" != "$PRIMARY" ] && [ "$HAS_CONFIG" = 1 ]; then
+    for _lp in $(cfg_list links); do
+      if [ ! -L "$WT_PATH/$_lp" ] || [ "$(readlink "$WT_PATH/$_lp")" != "$PRIMARY/$_lp" ]; then
+        echo "MISSING link: $_lp (wt link)"
+      fi
+    done
+  fi
+
   if command -v fzf >/dev/null 2>&1; then
     echo "fzf:       $(fzf --version 2>/dev/null | head -1)"
   else
@@ -959,6 +1057,11 @@ worktree paths must be space-free. Change worktrees.path or the branch name." ;;
     git worktree add -b "$_branch" "$_path" "$_base" >&2
   else
     git worktree add -b "$_branch" "$_path" >&2
+  fi
+
+  # stderr only: stdout is the cd channel for the shell wrapper.
+  if [ "$HAS_CONFIG" = 1 ] && [ -n "$(cfg_list links)" ]; then
+    apply_links "$_path" >&2
   fi
 
   # The prepare hook must run exactly once. `wt run` already runs
@@ -1283,6 +1386,7 @@ wt — worktree-aware runner (config: worktree-kit.yml at the primary checkout)
   wt ps                  list running worktree servers
   wt logs [slug]         follow a server's logs
   wt localize <file...>  snapshot a personal overlay (--list / --remove)
+  wt link [--all | slug...]   symlink links: paths from the primary into worktrees
   wt reset [slug]        clear the own-db bootstrap marker
   wt new <branch> [--from <base>] [--server]   create a branch + worktree
   wt switch [<branch>]   cd to a worktree; no argument opens a picker
@@ -1312,6 +1416,7 @@ case "$1" in
   ps) shift; cmd_ps "$@" ;;
   logs) shift; cmd_logs "$@" ;;
   localize) shift; cmd_localize "$@" ;;
+  link) shift; cmd_link "$@" ;;
   reset) shift; cmd_reset "$@" ;;
   new) shift; cmd_new "$@" ;;
   switch) shift; cmd_switch "$@" ;;
