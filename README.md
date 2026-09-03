@@ -2,8 +2,8 @@
 
 # worktree-kit
 
-**Run every branch of one repo side by side — each git worktree with its own
-server, port, and database.**
+**Every branch of your repo, running side by side — each git worktree with
+its own server, port, Redis slot, and database.**
 
 [![test](https://github.com/VSN2015/worktree-kit/actions/workflows/test.yml/badge.svg)](https://github.com/VSN2015/worktree-kit/actions/workflows/test.yml)
 [![npm](https://img.shields.io/npm/v/worktree-kit?logo=npm&color=cb3837)](https://www.npmjs.com/package/worktree-kit)
@@ -12,39 +12,173 @@ server, port, and database.**
 [![runtime deps](https://img.shields.io/badge/runtime%20deps-none-2ea44f)](#install)
 [![license](https://img.shields.io/github/license/VSN2015/worktree-kit?color=blue)](LICENSE)
 
-[Install](#install) · [Setup](#per-repo-setup) · [Config](#config-reference) · [Commands](#daily-use) · [Shell integration](#shell-integration) · [Stack guides](#stack-guide-rails-on-docker-compose) · [Caveats](#caveats)
+[Features](#features) · [Why](#why) · [Install](#install) · [Quick start](#quick-start) · [Commands](#commands-at-a-glance) · [Setup](#per-repo-setup) · [Config](#config-reference) · [Stack guides](#stack-guide-rails-on-docker-compose) · [Caveats](#caveats)
 
 </div>
 
 ---
 
-`wt` runs commands and app servers for git worktrees, so many branches of one
-repo can run side by side without collisions. It is stack-agnostic: the core
-executes only commands that each repo declares in a `worktree-kit.yml`.
+`wt` turns git worktrees into complete, isolated development environments,
+from one POSIX-sh file. Create a branch and its worktree in one step. Start
+its server and it gets a stable port and its own database without being
+asked. Run the test suite in five worktrees at once without them clobbering
+each other. When the branch is done, one command squashes, merges, and
+reclaims everything it used: server, database, Redis slot, worktree, and
+branch.
+
+It exists so that many branches, and many coding agents, can work on one
+repo at the same time without stepping on each other. The core is
+stack-agnostic and only runs commands your repo declares in a
+`worktree-kit.yml`; templates for Rails, Laravel, Django, Node, and Go, on
+Docker Compose or the bare host, get you there with one `wt init`.
 
 ```sh
-cd ~/code/myapp
-git worktree add -b phase02 ../myapp-phase02 master
-cd ../myapp-phase02
+$ wt new feat/refund-flow --server
+wt: feat_refund_flow [isolated] -> http://localhost:3412  (logs: wt logs feat_refund_flow)
 
-wt server
-# myapp_phase02 [isolated] -> http://localhost:3247
+$ wt run --isolated bundle exec rspec spec/     # this branch, in its own test database
 
-wt run --isolated bundle exec rspec spec/
-# specs on this branch, in its own test database
+$ wt merge                                      # squash → rebase → fast-forward trunk → tear down
+wt: backup: refs/wt/premerge/feat_refund_flow -> 9f1c2ab
+wt: merged feat/refund-flow into master
+wt: undo:   git -C /Users/you/code/myapp reset --hard 4e0d7c1   (branch backup: refs/wt/premerge/feat_refund_flow)
 ```
+
+## Features
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+**🌳 The whole worktree lifecycle**
+
+`wt new` creates a branch and its worktree from a path template and runs your
+prepare hook. `wt switch` hops between worktrees through an `fzf` picker with
+a live log-and-status preview. `wt list` shows every worktree with its git
+status, running server, and isolation level. `wt rm` and `wt merge` tear one
+down and reclaim everything it used.
+
+</td>
+<td width="50%" valign="top">
+
+**🚀 A server per branch, no port juggling**
+
+`wt server` starts this worktree's app detached and prints its URL. The port
+is a stable hash of the worktree name, so every branch keeps the same URL
+across restarts, and a busy port slides to the next free one. `wt up` starts
+every worktree at once; `wt ps`, `wt logs`, and `wt down` run the fleet.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+**🔒 Three isolation levels, chosen for you**
+
+`shared` uses the primary's everything. `isolated` gives the worktree its own
+Redis DB number and its own test database. `own_db` adds a private dev
+database, created and loaded once on first use. Servers pick a level
+automatically and escalate to `own_db` the moment a branch adds a migration
+the primary lacks. A flag or a per-user pin overrides any of it.
+
+</td>
+<td valign="top">
+
+**🧪 Test suites in parallel**
+
+Every worktree gets its own test database at `--isolated`, so `rspec`,
+`phpunit`, `pytest`, `jest`, and `go test` can run in every branch at the
+same time. No more schema reloads from another branch landing mid-run.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+**🐳 Docker Compose or bare host, same config**
+
+The compose runner mounts the worktree over your service's checkout in a
+one-off container, so `docker` finally runs the branch's code instead of the
+primary's. The host runner runs plain processes with the isolation env
+exported. Switch between them with one key in the config.
+
+</td>
+<td valign="top">
+
+**🧩 Stack templates, stack-agnostic core**
+
+`wt init` detects Rails, Laravel, Django, Node, or Go and writes a working
+`worktree-kit.yml`. The core has no framework knowledge: it only runs the
+hooks you declare, so Elixir, Rust, plain PHP, or a static-site build are one
+copied template away.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+**📎 Personal files follow you into every worktree**
+
+`wt localize` snapshots your tweaked `database.yml` or `development.rb` and
+mounts it read-only into every container. `wt link` symlinks gitignored
+folders that live only in the primary, such as a repo-local `.claude/`, into
+every worktree, and `wt new` does it for you.
+
+</td>
+<td valign="top">
+
+**🛡️ Safe by default**
+
+`wt rm` refuses a dirty or unmerged worktree and asks before deleting.
+`wt merge` writes a backup ref before rewriting a single commit and restores
+the branch on any conflict, with the undo command printed. A database is
+dropped only when wt created it; anything it merely found is left alone.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+**⚡ Zero dependencies, millisecond startup**
+
+One POSIX `sh` file, on macOS and Linux. YAML is read by whatever is already
+on your machine (`yq`, `ruby`, or `python3`) and cached as shell variables,
+so everyday commands spawn no interpreter at all. CI runs the suite on Debian
+and Alpine.
+
+</td>
+<td valign="top">
+
+**🐚 Shell integration that actually changes directory**
+
+`eval "$(wt shell-init zsh)"` (or `bash`, or `fish`) makes `new`, `switch`,
+`rm`, and `merge` land you in the right worktree. `wt doctor` checks the
+whole setup: config, runner, YAML backend, docker, the worktree path
+template, links, overlays, `fzf`, and whether that integration is live.
+
+</td>
+</tr>
+</table>
 
 ## Why
 
-Parallel agent/branch work with git worktrees hits three walls:
+Parallel work on one repo — several branches, several coding agents, or both
+— runs into the same four walls:
 
-1. **Docker runs the wrong code** — compose mounts only the primary checkout,
-   so `docker exec` runs the wrong code for a worktree.
-2. **Servers fight over ports** — every branch wants :3000.
-3. **Branches share one everything** — one database, one Redis, one job queue.
+1. **Docker runs the wrong code.** Compose mounts only the primary checkout,
+   so `docker exec` in a worktree silently runs the primary's code.
+2. **Servers fight over ports.** Every branch wants `:3000`.
+3. **Branches share one everything.** One database, one Redis, one job
+   queue. A migration on one branch breaks every other; a spec run on one
+   branch reloads the schema under another.
+4. **Worktrees are a chore.** `git worktree add`, `cd`, install deps, find a
+   free port, remember which database belongs to which branch, and later
+   remove the worktree, delete the branch, and drop the database you forgot.
 
-`wt` fixes all three: per-worktree containers (or host processes), stable
-auto-assigned ports, and opt-in isolation (own Redis DB number, own database).
+`wt` takes down all four: per-worktree containers or processes running the
+right code, stable auto-assigned ports, opt-in isolation with its own Redis
+DB and database, and a lifecycle that creates and reclaims all of it with
+one command each.
 
 ## Install
 
@@ -74,6 +208,65 @@ The YAML reader only runs when the config changes — wt caches the parsed
 config under `.git/wt-state/` and sources it, so everyday commands start
 in milliseconds with no interpreter spawns. Compose repos additionally
 need docker.
+
+## Quick start
+
+```sh
+# 1. once per repo: detect the stack, write worktree-kit.yml, check the setup
+cd ~/code/myapp
+wt init && wt doctor
+
+# 2. once per machine: let wt cd your shell (bash, zsh, or fish)
+echo 'eval "$(wt shell-init zsh)"' >> ~/.zshrc && exec zsh
+
+# 3. a branch, its worktree, and its server in one step
+wt new feat/login --server
+#    -> ~/code/myapp-worktrees/feat_login   http://localhost:3xxx   [isolated]
+
+# 4. work on it: the suite on this branch, in this branch's own test database
+wt run --isolated bin/rails db:test:prepare      # once per worktree
+wt run --isolated bundle exec rspec spec/
+
+# 5. see everything, hop around
+wt list
+wt switch                                        # fzf picker over every worktree
+
+# 6. done: squash into one commit, rebase, fast-forward master, reclaim everything
+wt merge
+```
+
+> [!NOTE]
+> The one manual step per stack: your app has to read the env vars wt exports
+> (a one-line change in `database.yml`, `settings.py`, or the like). The
+> [stack guides](#stack-guide-rails-on-docker-compose) show it for each
+> framework, and the template `wt init` writes names the variables.
+
+## Commands at a glance
+
+| command                                                                   | what it does                                              |
+|---------------------------------------------------------------------------|-----------------------------------------------------------|
+| [`wt new <branch> [--from <base>] [--server]`](#wt-new--create-a-branch--worktree) | create a branch + worktree, optionally start its server |
+| [`wt switch [<branch>]`](#wt-switch--jump-to-a-worktree)                  | cd to a worktree; no argument opens a picker              |
+| [`wt list [--all]`](#wt-list--see-every-worktree)                         | every worktree: branch, slug, status, server, isolation   |
+| [`wt rm [<branch>] [--keep-branch] [--force]`](#wt-rm--tear-down-a-worktree) | tear down and remove a worktree                        |
+| [`wt merge [<branch>] [--into <trunk>] [-m <msg>] [--no-remove] [--force]`](#wt-merge--squash-rebase-fast-forward-tear-down) | squash, rebase, fast-forward trunk, then tear down |
+| [`wt run [flags] [--] <cmd...>`](#wt-run--one-off-commands)               | one-off command in this worktree                          |
+| [`wt server [flags] [port]`](#wt-server--this-worktrees-server)           | start this worktree's server, detached                    |
+| [`wt up [flags] [slug...]`](#wt-up--everything-at-once)                   | start servers for all (or the named) worktrees            |
+| [`wt down [slug...]`](#wt-down--stop-servers)                             | stop servers — all of them, or the named ones             |
+| [`wt ps`](#wt-ps--whats-running)                                          | list running worktree servers                             |
+| [`wt logs [slug]`](#wt-logs--follow-a-server)                             | follow a server's logs                                    |
+| [`wt localize <file...>`](#wt-localize--personal-overlays)                | snapshot a personal overlay (`--list` / `--remove`)       |
+| [`wt link [--all \| slug...]`](#wt-link--host-visible-symlinks)           | symlink `links:` paths from the primary into worktrees    |
+| [`wt reset [slug]`](#wt-reset--re-bootstrap-an-own-db-worktree)           | clear the own-db bootstrap marker                         |
+| [`wt init`](#wt-init--wt-doctor--setup-and-checks)                        | write `worktree-kit.yml` from a stack template            |
+| [`wt doctor`](#wt-init--wt-doctor--setup-and-checks)                      | environment + config checks                               |
+| [`wt shell-init [bash\|zsh\|fish]`](#shell-integration)                   | emit the shell function that makes `switch`/`new`/`rm`/`merge` cd |
+
+The isolation flags `--shared` / `--isolated` / `--own-db` work on `run`,
+`server`, and `up`; the [isolation](#isolation) section covers what each
+level exports. `wt --help` prints this summary and `wt --version` the
+version; both work outside a git repo.
 
 ## Per-repo setup
 
@@ -416,14 +609,23 @@ Every stack ships both runner variants under `templates/compose/` and
 `templates/host/` — if `wt init` picks the wrong one (say, a compose file
 that isn't your dev stack), copy the other variant over `worktree-kit.yml`.
 
-## Workflow: branch → worktree → server
+## Workflow: with `wt new`, or plain `git worktree add`
 
-`wt` has no worktree-creation command on purpose — worktrees are plain
-`git worktree add`, and `wt` picks up context from wherever you run it: it
-resolves the primary checkout via the git common dir and reads
-`worktree-kit.yml` from there, so a fresh worktree needs zero setup.
+`wt` takes its context from git, not from the worktree: it resolves the
+primary checkout through the git common dir and reads `worktree-kit.yml`
+from there. A worktree therefore needs zero setup, whether `wt new` made it
+or you ran `git worktree add` yourself.
 
-Checkout an existing branch into a worktree:
+The `wt` way, start to finish:
+
+```sh
+wt new feat/login --from origin/main       # branch + worktree at worktrees.path, prepare hook run
+wt server                                  # own port, auto isolation
+wt run --isolated bundle exec rspec spec/  # own test DB
+wt merge                                   # squash, rebase, fast-forward trunk, reclaim everything
+```
+
+Plain git works just as well; `wt` joins in whenever you call it:
 
 ```sh
 cd ~/code/myapp                                  # primary checkout (has worktree-kit.yml)
@@ -431,35 +633,25 @@ git worktree add ../myapp-fix-login fix-login    # plain git — wt is not invol
 cd ../myapp-fix-login
 wt run --isolated bundle exec rspec spec/        # specs on this branch, own test DB
 wt server                                        # own port + auto isolation for this branch
+wt rm                                            # done: server, DB, Redis slot, worktree, branch
 ```
 
-Or create a new branch as a worktree in one step:
-
-```sh
-git worktree add -b phase02 ../myapp-phase02 master
-cd ../myapp-phase02
-wt server        # -> "myapp_phase02 [isolated] -> http://localhost:3xxx"
-```
-
-Tear down when the branch is done:
-
-```sh
-wt down myapp_fix_login                # stop its server
-git worktree remove ../myapp-fix-login
-wt reset myapp_fix_login               # clear the db-bootstrap marker if it used own-db
-```
-
-If the worktree ran at `own_db`, its `wt_<slug>` database is yours to drop —
-`wt` never deletes data.
+`wt rm` stops the server, drops the `wt_<slug>` database when wt created it
+(and `db_drop` is configured), flushes the Redis slot when `redis_flush` is,
+then removes the worktree and its branch; `--keep-branch` keeps the branch.
+The manual equivalent is `wt down <slug>`, `git worktree remove`, and
+`wt reset <slug>`. A database wt merely adopted rather than created is yours
+to drop, and wt says so instead of touching it.
 
 Two consequences of how slugs work:
 
 - The worktree **directory name becomes the slug** (lowercased,
   non-alphanumeric → `_`), and the slug drives the port hash and the Redis
   `{n}` slot — so name worktree dirs distinctly (`../myapp-phase02`, not
-  `../wt2`). Names longer than 40 chars are cut to a prefix plus a checksum
-  of the full name, so `wt_{slug}_test`-style database names always fit
-  inside the 63/64-char identifier limits of postgres/mysql.
+  `../wt2`). `wt new` does this for you through `worktrees.path`. Names
+  longer than 40 chars are cut to a prefix plus a checksum of the full name,
+  so `wt_{slug}_test`-style database names always fit inside the 63/64-char
+  identifier limits of postgres/mysql.
 - The worktree itself carries no config; running `wt` from the primary
   checkout also works and is always treated as `shared`.
 
@@ -493,40 +685,19 @@ wt: not cd'd — install shell integration: eval "$(wt shell-init zsh)"
 so `cd "$(wt switch feat/login)"` works too, if you'd rather not install the
 function.
 
-## Daily use
+## Command reference
 
 Every command takes its context from the directory you run it in: `wt`
 resolves the primary checkout through git, reads `worktree-kit.yml` from
 there, and derives this worktree's **slug** from its directory name
 (lowercased, non-alphanumeric → `_`, so `../myapp-fix-login` becomes
 `myapp_fix_login`). Commands that name a worktree (`up`, `down`, `logs`,
-`reset`) take that slug, not a path — `wt ps` shows the slugs of everything
-running.
+`reset`, `link`) take that slug, not a path — `wt ps` shows the slugs of
+everything running. The lifecycle commands (`new`, `switch`, `rm`, `merge`)
+take a **branch name** instead, since that is what you think in.
 
-| command                                 | what it does                                        |
-|-----------------------------------------|-----------------------------------------------------|
-| `wt run [flags] [--] <cmd...>`          | one-off command in this worktree                    |
-| `wt server [flags] [port]`              | start this worktree's server, detached              |
-| `wt up [flags] [slug...]`               | start servers for all (or the named) worktrees      |
-| `wt down [slug...]`                     | stop servers — all of them, or the named ones       |
-| `wt ps`                                 | list running worktree servers                       |
-| `wt logs [slug]`                        | follow a server's logs                              |
-| `wt localize <file...>`                 | snapshot a personal overlay (`--list` / `--remove`) |
-| `wt link [--all \| slug...]`            | symlink `links:` paths from the primary into worktrees |
-| `wt reset [slug]`                       | clear the own-db bootstrap marker                   |
-| `wt new <branch> [--from <base>] [--server]` | create a branch + worktree                     |
-| `wt switch [<branch>]`                  | cd to a worktree; no argument opens a picker        |
-| `wt rm [<branch>] [--keep-branch] [--force]` | tear down and remove a worktree                |
-| `wt merge [<branch>] [--into <trunk>] [-m <msg>] [--no-remove] [--force]` | squash, rebase, fast-forward trunk, then tear down |
-| `wt list [--all]`                       | list worktrees (branch, slug, status, server, isolation) |
-| `wt init`                               | write `worktree-kit.yml` from a stack template      |
-| `wt doctor`                             | environment + config checks                         |
-| `wt shell-init [bash\|zsh\|fish]`       | emit the shell function that makes `switch`/`new`/`rm`/`merge` cd |
-
-The isolation flags `--shared` / `--isolated` / `--own-db` work on `run`,
-`server`, and `up`; the [isolation](#isolation) section above covers what
-each level exports. `wt --help` prints this summary, `wt --version` the version — both
-work outside a git repo.
+The [table above](#commands-at-a-glance) lists every command; the sections
+below give the details.
 
 ### wt run — one-off commands
 
@@ -823,11 +994,16 @@ read-only over the container's copy in every compose run. Two things to know:
 
 ## Testing
 
-`./test/linux.sh [debian|alpine]` runs the Linux suite in containers
-(requires docker): install (clone symlink on Debian, `curl | sh` remote
-mode on Alpine), `wt init` stack detection, the ruby and python3 + PyYAML
-YAML backends, isolation env export, and the server lifecycle including
-busy-port detection via bind probe and `ss`.
+- `./test/lifecycle.sh` runs the lifecycle suite against throwaway repos:
+  `wt new`, `wt switch`, `wt list`, `wt rm`, `wt merge`, `wt link`,
+  `wt doctor`, and the `shell-init` wrappers. Git only — no docker, no YAML
+  backend needed — so it runs anywhere in seconds.
+- `./test/linux.sh [debian|alpine]` runs the Linux suite in containers
+  (requires docker): install (clone symlink on Debian, `curl | sh` remote
+  mode on Alpine), `wt init` stack detection, the ruby and python3 + PyYAML
+  YAML backends, isolation env export, the server lifecycle including
+  busy-port detection via bind probe and `ss`, and then the lifecycle suite
+  above. GitHub Actions runs both distros on every push.
 
 ---
 
