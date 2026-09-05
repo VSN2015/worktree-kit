@@ -473,7 +473,8 @@ Three levels, each a superset of the last:
 - **`migration_paths`** — dirs compared file-by-file against the primary
   checkout. If the worktree has files the primary lacks (i.e. new
   migrations), `wt server` auto-escalates that worktree to `own_db`, because
-  migrating the shared DB would break every other branch.
+  migrating the shared DB would break every other branch. Entries may be
+  globs — the Django templates use `*/migrations` to cover every app.
 - **`db_drop`** (optional) — destroys the per-worktree database. `wt rm` and
   `wt merge` run it only when the worktree's database carries a `.dbowned`
   marker — i.e. `db_bootstrap` created it, as opposed to `db_check` merely
@@ -706,7 +707,8 @@ wt run [--shared|--isolated|--own-db] [--] <command...>
 ```
 
 Runs one command in this worktree and exits. The `prepare` hook runs first
-(both runners), then the command — in a fresh `docker compose run --rm`
+(both runners — with the same template variables and isolation env as the
+command itself), then the command — in a fresh `docker compose run --rm`
 container with the worktree mounted over `compose.workdir` (compose runner),
 or as a plain process in the worktree directory (host runner). When attached
 to a terminal the compose runner allocates a TTY, so interactive commands
@@ -741,8 +743,8 @@ to `own_db`; everything else runs `isolated`.
 The port likewise: an explicit positional port beats a `local.yml` pin,
 which beats the stable slug hash in 3000–3899 (bumped upward until free).
 Explicit and pinned ports are checked but never bumped — `wt server` refuses
-to start if one is busy. It also refuses if this slug already has a running
-server (`wt down <slug>` first).
+to start if one is busy, or if the port is not a number in 1–65535. It also
+refuses if this slug already has a running server (`wt down <slug>` first).
 
 Compose runner: a detached container named `wt-<project>-<slug>` publishing
 `<port>:<container_port>`. Host runner: a nohup'd process with a pidfile
@@ -863,9 +865,10 @@ Creates the branch (or adopts an existing one of the same name) and a
 `git worktree add` at `worktrees.path`, runs `hooks.prepare` once, and prints
 the new worktree's path on the cd channel (see
 [Shell integration](#shell-integration)). `--from <base>` branches off
-`<base>` instead of `HEAD`; `--server` starts the server immediately instead
-(it runs `prepare` itself, so plain `wt new` doesn't also run it, to avoid
-running the hook twice).
+`<base>` instead of `HEAD`, and is refused for a branch that already exists
+(adopting it would silently ignore the base); `--server` starts the server
+immediately instead (it runs `prepare` itself, so plain `wt new` doesn't also
+run it, to avoid running the hook twice).
 
 ```sh
 wt new feat/login                    # new branch + worktree off HEAD
@@ -935,8 +938,11 @@ body); `--no-remove` merges without tearing down.
 > [!IMPORTANT]
 > `wt merge` never prompts — there is nothing for `--force` to skip there.
 > Its `--force` only waives the one guard that exists: refusing to squash a
-> branch that has an upstream (squashing would rewrite already-published
-> history). This is different from `wt rm --force`, which waives both the
+> branch that is published — one a remote holds under its own name, like
+> `origin/feat/login` (squashing would rewrite already-published history).
+> A branch that merely *tracks* `origin/main` because it was created with
+> `wt new --from origin/main` is not published and merges without `--force`.
+> This is different from `wt rm --force`, which waives both the
 > safety refusals *and* the confirmation prompt. Note that the teardown is
 > the forceful kind either way — passing `--force` does not make it any more
 > destructive, and omitting it does not make it any less. Use `--no-remove`
@@ -948,9 +954,9 @@ body); `--no-remove` merges without tearing down.
 wt list [--all]
 ```
 
-A table of every worktree: branch, slug, git status (`clean`/`dirty`),
-running server (if any), isolation level, and path. `--all` also lists
-branches that have no worktree.
+A table of every worktree: branch, slug, git status (`clean`/`dirty`, or
+`missing` for a deleted, not-yet-pruned directory), running server (if any),
+isolation level, and path. `--all` also lists branches that have no worktree.
 
 ### wt init / wt doctor — setup and checks
 

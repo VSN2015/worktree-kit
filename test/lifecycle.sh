@@ -665,7 +665,7 @@ master_before_upstream="$(git -C "$REPO" rev-parse master)"
 
 assert_fails "merge: refuses a branch with an upstream without --force" "$WT" merge feat/pushed
 uerr="$("$WT" merge feat/pushed 2>&1 >/dev/null || true)"
-assert_contains "$uerr" "has an upstream" \
+assert_contains "$uerr" "published as" \
   "merge: the upstream refusal names the upstream, not some later incidental failure"
 assert_eq "0" "$(test -d "$pdir" && echo 0 || echo 1)" \
   "merge: refused-upstream worktree survives"
@@ -966,6 +966,230 @@ fi
 # no config at all is an error too, and needs no YAML backend to prove
 new_repo noconfiglinkrepo
 assert_fails "link: fails without a worktree-kit.yml" "$WT" link --all
+
+# ---------- 0.3.2 review: isolation, hooks, merge, list, server ----------
+
+# detect_isolation tested `[ -d "$WT_PATH/$mp" ]` with $mp quoted, so a glob
+# in migration_paths — the Django templates ship "*/migrations" — never
+# matched anything, and a Django worktree carrying brand-new migrations was
+# still started as `isolated`, i.e. on the shared development database.
+new_repo globrepo
+if have_yaml; then
+  mkdir -p app/migrations
+  echo m > app/migrations/0001_initial.py
+  cat > worktree-kit.yml <<'YML'
+runner: host
+hooks:
+  server: "true"
+isolation:
+  migration_paths: ["*/migrations"]
+  db_bootstrap: "true"
+YML
+  git add -A && git commit -qm 'glob config'
+  wt_ok new feat/newmig
+  gdir="$TMP/globrepo-worktrees/feat_newmig"
+  echo m > "$gdir/app/migrations/0002_added.py"
+  # from a SUBDIRECTORY: the glob used to be expanded by the shell against
+  # the cwd (an unquoted $(cfg_list ...)), so it only ever worked at the root
+  err="$( (cd "$gdir/app" && "$WT" server 2>&1 >/dev/null) || true )"
+  assert_contains "$err" "feat_newmig [own_db]" \
+    "server: a migration_paths glob (*/migrations) with new files escalates to own_db"
+  wt_ok down feat_newmig
+  # control: the same glob with nothing new must stay at isolated
+  wt_ok new feat/samemig
+  err="$( (cd "$TMP/globrepo-worktrees/feat_samemig" && "$WT" server 2>&1 >/dev/null) || true )"
+  assert_contains "$err" "feat_samemig [isolated]" \
+    "server: a migration_paths glob with no new files stays isolated"
+  wt_ok down feat_samemig
+else
+  ok "server: a migration_paths glob (*/migrations) with new files escalates to own_db (skipped: no YAML backend)"
+  ok "server: a migration_paths glob with no new files stays isolated (skipped: no YAML backend)"
+fi
+
+# hooks.prepare is documented as taking template variables and as running
+# before every wt run — but the host `wt run` path ran it raw ({slug} left
+# literal) and without the isolation env the payload itself receives, so a
+# prepare hook like `createdb wt_{slug}_test` or `rails db:test:prepare`
+# under --isolated could not do its job. wt server had both right.
+new_repo preprunrepo
+if have_yaml; then
+  prep_out="$TMP/prepare-run.txt"
+  : > "$prep_out"
+  cat > worktree-kit.yml <<YML
+runner: host
+hooks:
+  prepare: "echo slug={slug} FOO=\${FOO:-unset} >> $prep_out"
+  server: "true"
+isolation:
+  isolated_env:
+    FOO: "bar"
+YML
+  "$WT" run --isolated -- true >/dev/null 2>&1 || fail "setup: wt run --isolated with a prepare hook"
+  assert_contains "$(cat "$prep_out")" "slug=preprunrepo" \
+    "run: the prepare hook gets template variables expanded"
+  assert_contains "$(cat "$prep_out")" "FOO=bar" \
+    "run: the prepare hook runs under the isolation env, like the payload"
+else
+  ok "run: the prepare hook gets template variables expanded (skipped: no YAML backend)"
+  ok "run: the prepare hook runs under the isolation env, like the payload (skipped: no YAML backend)"
+fi
+
+# `wt new <branch> --from origin/<trunk>` (the README's own example) makes
+# git set the new branch's upstream to origin/<trunk>. wt merge treated ANY
+# upstream as "published history" and refused without --force, so the
+# documented flow could never merge cleanly. Published means the branch
+# itself exists on a remote — a remote-tracking ref carrying its name.
+new_repo fromrepo
+from_bare="$TMP/from-bare.git"
+git init -q --bare "$from_bare"
+git remote add origin "$from_bare"
+git push -q origin master
+wt_ok new feat/tracked --from origin/master
+tdir="$TMP/fromrepo-worktrees/feat_tracked"
+assert_eq "origin/master" \
+  "$(git -C "$tdir" rev-parse --abbrev-ref 'feat/tracked@{upstream}' 2>/dev/null || echo none)" \
+  "new --from origin/<trunk>: git sets the branch to track the base (precondition)"
+( cd "$tdir" && echo t > t.txt && git add t.txt && git commit -qm tracked )
+if "$WT" merge feat/tracked >/dev/null 2>&1; then
+  ok "merge: a branch that merely tracks origin/<trunk> is not treated as published"
+else
+  fail "merge: a branch that merely tracks origin/<trunk> is not treated as published"
+fi
+
+# git worktree list --porcelain prints "worktree <path>"; every awk reader
+# took $2 — the path up to its first space. A worktree at a path with a
+# space (made by git itself; wt new refuses such paths) listed truncated,
+# and wt switch handed the shell wrapper a directory that does not exist.
+new_repo spacepathrepo
+spdir="$TMP/spacepathrepo-worktrees/has space"
+git worktree add -q "$spdir" -b feat/spaced
+out="$("$WT" list)" || fail "setup: wt list with a spaced worktree path"
+assert_contains "$out" "$spdir" "list: a worktree path containing a space is printed whole"
+out="$(WT_SHELL_INTEGRATION=1 "$WT" switch feat/spaced 2>/dev/null)" \
+  || fail "setup: wt switch to a spaced path"
+assert_eq "$spdir" "$out" "switch: a worktree path containing a space is printed whole"
+
+# wt list reported a worktree whose directory had been deleted (rm -rf, not
+# yet pruned) as "clean": git -C <gone> status fails, its output is empty,
+# and empty read as clean. Say what is actually going on.
+new_repo prunablerepo
+pdir="$TMP/prunablerepo-worktrees/gone"
+git worktree add -q "$pdir" -b feat/gonedir
+rm -rf "$pdir"
+out="$("$WT" list)" || fail "setup: wt list with a deleted worktree directory"
+assert_contains "$(printf '%s\n' "$out" | grep 'feat/gonedir')" "missing" \
+  "list: a worktree whose directory is gone reports missing, not clean"
+
+# With no branch argument, wt rm / wt merge take the current branch. On a
+# detached HEAD that is the literal string "HEAD", and both went on to say
+# "no worktree for branch HEAD" — true, but not the problem.
+new_repo detachedrepo
+git checkout -q --detach
+err="$("$WT" rm 2>&1 >/dev/null || true)"
+assert_contains "$err" "detached HEAD" \
+  "rm: on a detached HEAD with no branch argument, names the real problem"
+err="$("$WT" merge 2>&1 >/dev/null || true)"
+assert_contains "$err" "detached HEAD" \
+  "merge: on a detached HEAD with no branch argument, names the real problem"
+
+# wt server took any first argument as the port. A typo (wt server --isolate)
+# or a word reached lsof as a service name, lsof failed, that failure read
+# as "port free", and a server started with the word as its port — and as
+# the {port} every hook saw.
+new_repo portvalrepo
+if have_yaml; then
+  printf 'runner: host\nhooks:\n  server: "true"\n' > worktree-kit.yml
+  assert_fails "server: refuses a non-numeric port" "$WT" server abc
+  err="$("$WT" server abc 2>&1 >/dev/null || true)"
+  assert_contains "$err" "not a port number: abc" "server: the bad-port refusal names the argument"
+  assert_fails "server: refuses a port above 65535" "$WT" server 70000
+  assert_fails "server: refuses a mistyped flag in the port position" "$WT" server --isolate
+  "$WT" down >/dev/null 2>&1 || true
+else
+  ok "server: refuses a non-numeric port (skipped: no YAML backend)"
+  ok "server: the bad-port refusal quotes the argument (skipped: no YAML backend)"
+  ok "server: refuses a port above 65535 (skipped: no YAML backend)"
+  ok "server: refuses a mistyped flag in the port position (skipped: no YAML backend)"
+fi
+
+# ---------- older git: no --path-format ----------
+#
+# `git rev-parse --path-format=absolute` arrived in git 2.31; on older hosts
+# ctx_init died with git's usage error before any command ran. Simulate one
+# with a shim that rejects the flag and hands everything else to the real
+# git. Without the flag, --git-common-dir is RELATIVE inside the primary
+# (".git" at the root, "../.git" in a subdirectory) and absolute in a linked
+# worktree — the fallback must get all three right.
+new_repo oldgitrepo
+OLDGIT_BIN="$TMP/oldgit-bin"
+mkdir -p "$OLDGIT_BIN"
+cat > "$OLDGIT_BIN/git" <<'SHIM'
+#!/bin/sh
+for a in "$@"; do
+  case "$a" in --path-format=*) echo "error: unknown option 'path-format=absolute'" >&2; exit 129 ;; esac
+done
+exec "$WT_REAL_GIT" "$@"
+SHIM
+chmod +x "$OLDGIT_BIN/git"
+WT_REAL_GIT="$(command -v git)"; export WT_REAL_GIT
+git worktree add -q "$TMP/oldgitrepo-worktrees/feat_old" -b feat/old
+mkdir -p "$REPO/sub"
+if out="$(PATH="$OLDGIT_BIN:$PATH" "$WT" list 2>&1)"; then
+  ok "old git: wt list runs on a git without --path-format"
+else
+  fail "old git: wt list runs on a git without --path-format: $out"
+fi
+assert_contains "$out" "feat/old" "old git: the worktree table is intact"
+out="$( (cd "$REPO/sub" && PATH="$OLDGIT_BIN:$PATH" "$WT" doctor 2>&1) || true )"
+assert_contains "$out" "primary:   $REPO" \
+  "old git: the primary resolves from a subdirectory (relative ../.git)"
+out="$( (cd "$TMP/oldgitrepo-worktrees/feat_old" && PATH="$OLDGIT_BIN:$PATH" "$WT" doctor 2>&1) || true )"
+assert_contains "$out" "primary:   $REPO" \
+  "old git: the primary resolves from a linked worktree"
+assert_contains "$out" "slug: feat_old" \
+  "old git: the worktree context is the linked worktree's own"
+unset WT_REAL_GIT
+
+# ---------- wt new --from on a branch that already exists ----------
+#
+# An existing branch is adopted as it is: `git worktree add <path> <branch>`
+# takes no start point, so a --from given alongside was silently dropped —
+# the user asked for a branch off <base> and got one off whatever the old
+# branch pointed at. Refuse, and say what to do instead.
+new_repo fromexistrepo
+git branch -q already
+git checkout -q -b other && git commit -q --allow-empty -m other && git checkout -q master
+assert_fails "new: refuses --from for a branch that already exists" "$WT" new already --from other
+err="$("$WT" new already --from other 2>&1 >/dev/null || true)"
+assert_contains "$err" "already exists" "new: the --from refusal says the branch exists"
+assert_eq "1" "$(test -d "$TMP/fromexistrepo-worktrees/already" && echo 0 || echo 1)" \
+  "new: nothing is created on the --from refusal"
+wt_ok new already
+assert_eq "0" "$(test -d "$TMP/fromexistrepo-worktrees/already" && echo 0 || echo 1)" \
+  "new: without --from the existing branch is still adopted"
+
+# ---------- {port} under wt run with PORT in the environment ----------
+#
+# expand() read the shell variable PORT, which wt run never sets — so it fell
+# through to the caller's environment. Node/Heroku-style setups export PORT
+# routinely, and {port} then expanded to that instead of the documented
+# "empty in wt run".
+new_repo portenvrepo
+if have_yaml; then
+  port_out="$TMP/port-run.txt"
+  : > "$port_out"
+  cat > worktree-kit.yml <<YML
+runner: host
+hooks:
+  prepare: "echo port=[{port}] >> $port_out"
+  server: "true"
+YML
+  PORT=9999 "$WT" run -- true >/dev/null 2>&1 || fail "setup: wt run with PORT exported"
+  assert_contains "$(cat "$port_out")" "port=[]" \
+    "run: {port} is empty under wt run even when the caller exports PORT"
+else
+  ok "run: {port} is empty under wt run even when the caller exports PORT (skipped: no YAML backend)"
+fi
 
 [ "$FAILED" = 0 ] || { echo "LIFECYCLE FAIL" >&2; exit 1; }
 echo "LIFECYCLE PASS"

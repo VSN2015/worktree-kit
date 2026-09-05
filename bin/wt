@@ -13,7 +13,7 @@
 # docker compose only for `runner: compose` repos.
 set -eu
 
-WT_VERSION="0.3.1"
+WT_VERSION="0.3.2"
 
 die() { echo "wt: $*" >&2; exit 1; }
 note() { echo "wt: $*" >&2; }
@@ -48,7 +48,17 @@ slugify() {
 ctx_init() {
   need git
   WT_PATH="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
-  GIT_COMMON="$(git rev-parse --path-format=absolute --git-common-dir)"
+  # --path-format is git 2.31+. Older gits print --git-common-dir RELATIVE
+  # inside the primary (".git" at the root, "../.git" below it) and absolute
+  # in a linked worktree; cd + pwd -P makes it absolute and symlink-resolved,
+  # matching --show-toplevel so the WT_PATH = PRIMARY comparisons hold.
+  if ! GIT_COMMON="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    GIT_COMMON="$(git rev-parse --git-common-dir)"
+    case "$GIT_COMMON" in
+      /*) ;;
+      *)  GIT_COMMON="$(CDPATH= cd "$GIT_COMMON" && pwd -P)" ;;
+    esac
+  fi
   PRIMARY="$(dirname "$GIT_COMMON")"
   CONFIG="$PRIMARY/worktree-kit.yml"
   LOCAL_CONFIG="$PRIMARY/worktree-kit.local.yml"
@@ -282,11 +292,13 @@ local_get() { # <dotted.path> [default] — worktree-kit.local.yml lookup
 
 expand() {
   printf '%s' "$1" | sed \
-    -e "s|{slug}|$SLUG|g" -e "s|{n}|$N|g" -e "s|{port}|${PORT:-}|g" \
+    -e "s|{slug}|$SLUG|g" -e "s|{n}|$N|g" -e "s|{port}|${WT_PORT:-}|g" \
     -e "s|{container_port}|$CONTAINER_PORT|g" -e "s|{project}|$PROJECT|g"
 }
 
-worktree_paths() { git worktree list --porcelain | awk '/^worktree /{print $2}'; }
+# "worktree <path>" lines: take the rest of the line, never $2 — a path with a
+# space (git makes them, even though wt new refuses them) was cut at the space.
+worktree_paths() { git worktree list --porcelain | awk '/^worktree /{print substr($0, 10)}'; }
 
 # ---------- lifecycle ----------
 
@@ -313,7 +325,7 @@ resolve_trunk() { # prints the trunk branch name, or empty
 
 worktree_for_branch() { # <branch> -> path, or empty. Always exits 0.
   git worktree list --porcelain | awk -v b="refs/heads/$1" '
-    /^worktree /{ p = $2 }
+    /^worktree /{ p = substr($0, 10) }
     $1 == "branch" && $2 == b { print p; exit }
   '
   true
@@ -324,15 +336,18 @@ worktree_for_branch() { # <branch> -> path, or empty. Always exits 0.
 worktree_rows() {
   _trunk="$(resolve_trunk)"
   git worktree list --porcelain | awk '
-    /^worktree /  { p = $2 }
+    /^worktree /  { p = substr($0, 10) }
     /^branch /    { b = $2; sub("refs/heads/", "", b); print p "\t" b }
     /^detached/   { print p "\t(detached)" }
   ' | while IFS="$TAB" read -r _p _b; do
     _s="$(slugify "$_p")"
 
+    # A deleted-but-unpruned directory makes every git -C call below fail
+    # silently, and an empty status used to read as "clean". Name the state.
     _st=clean
-    if [ -n "$(git -C "$_p" status --porcelain 2>/dev/null)" ]; then _st=dirty; fi
-    if [ -n "$_trunk" ] && git -C "$_p" rev-parse --verify --quiet "$_trunk" >/dev/null 2>&1; then
+    if [ ! -d "$_p" ]; then _st=missing
+    elif [ -n "$(git -C "$_p" status --porcelain 2>/dev/null)" ]; then _st=dirty; fi
+    if [ "$_st" != missing ] && [ -n "$_trunk" ] && git -C "$_p" rev-parse --verify --quiet "$_trunk" >/dev/null 2>&1; then
       _c="$(git -C "$_p" rev-list --left-right --count "$_trunk...HEAD" 2>/dev/null || printf '0\t0')"
       _behind="$(printf '%s' "$_c" | cut -f1)"
       _ahead="$(printf '%s' "$_c" | cut -f2)"
@@ -375,7 +390,7 @@ path_template() {
 
 # Escapes a value used as sed REPLACEMENT text, where & means "the whole
 # match", \ starts an escape, and | is our delimiter. Unlike expand()'s
-# inputs (SLUG, N, PORT, PROJECT — all already sanitized to safe charsets),
+# inputs (SLUG, N, WT_PORT, PROJECT — all already sanitized to safe charsets),
 # expand_path substitutes raw filesystem and git names: a repo directory
 # called "R&D-app" expanded {repo} to "R{repo}D-app", and a branch with a |
 # in it (legal in a git ref) broke the sed expression outright.
@@ -580,13 +595,25 @@ detect_isolation() {
   pin="$(local_get "servers.$SLUG.isolation" "" | tr - _)"
   if [ -n "$pin" ]; then echo "$pin"; return; fi
   [ "$WT_PATH" = "$PRIMARY" ] && { echo shared; return; }
+  # migration_paths may hold globs ("*/migrations" in the Django templates).
+  # They must expand against the WORKTREE: set -f keeps the unquoted
+  # $(cfg_list) from globbing against the cwd (which only ever matched when
+  # wt server ran at the worktree root), then $WT_PATH/$mp is left unquoted
+  # on purpose so the glob expands where it should. Worktree paths are
+  # space-free (wt new enforces it), so the word-splitting is safe.
+  set -f
   for mp in $(cfg_list isolation.migration_paths); do
-    [ -d "$WT_PATH/$mp" ] || continue
-    for f in "$WT_PATH/$mp"/*; do
-      [ -e "$f" ] || continue
-      [ -e "$PRIMARY/$mp/$(basename "$f")" ] || { echo own_db; return; }
+    set +f
+    for d in $WT_PATH/$mp; do
+      [ -d "$d" ] || continue
+      rel="${d#"$WT_PATH"/}"
+      for f in "$d"/*; do
+        [ -e "$f" ] || continue
+        [ -e "$PRIMARY/$rel/$(basename "$f")" ] || { set +f; echo own_db; return; }
+      done
     done
   done
+  set +f
   echo isolated
 }
 
@@ -693,14 +720,19 @@ compose_args() { # mounts + volumes + env for isolation level $1
   echo "$a"
 }
 
+# hooks.prepare with its template variables expanded, or `:` when unset — the
+# one string every runner path prefixes to its payload. wt server expanded
+# it from day one; the wt run paths used to run the raw hook, {slug} and all.
+prepare_cmd() { if [ -n "${PREPARE:-}" ]; then expand "$PREPARE"; else printf ':'; fi; }
+
 runner_exec() { # $1 = isolation level, $2 = shell string to run in the worktree
   if [ "$RUNNER" = compose ]; then
     cd "$PRIMARY"
     docker compose run --rm --no-deps -T $(compose_args "$1") "$SERVICE" \
-      sh -c "${PREPARE:-:}; $2"
+      sh -c "$(prepare_cmd); $2"
   else
     envs="$(iso_env_list "$1" | tr '\n' ' ')"
-    ( cd "$WT_PATH" && env $envs sh -c "${PREPARE:-:}; $2" )
+    ( cd "$WT_PATH" && env $envs sh -c "$(prepare_cmd); $2" )
   fi
 }
 
@@ -722,11 +754,14 @@ cmd_run() {
     cd "$PRIMARY"
     T=""; [ -t 1 ] || T="-T"
     exec docker compose run --rm --no-deps $T $(compose_args "$LEVEL") "$SERVICE" \
-      sh -c "${PREPARE:-:}; exec \"\$@\"" sh "$@"
+      sh -c "$(prepare_cmd); exec \"\$@\"" sh "$@"
   else
     envs="$(iso_env_list "$LEVEL" | tr '\n' ' ')"
     cd "$WT_PATH"
-    [ -n "${PREPARE:-}" ] && sh -c "$PREPARE"
+    # The hook runs under the same isolation env as the payload — a prepare
+    # that creates or migrates the per-worktree TEST database needs it. The
+    # compose path gets this for free: -e applies to the whole container.
+    if [ -n "${PREPARE:-}" ]; then env $envs sh -c "$(prepare_cmd)"; fi
     exec env $envs "$@"
   fi
 }
@@ -742,8 +777,13 @@ cmd_server() {
   esac; done
   [ -n "$SERVER_CMD" ] || die "no hooks.server in worktree-kit.yml"
   [ -n "$LEVEL" ] || LEVEL="$(detect_isolation)"
-  PORT="${1:-$(pick_port)}"
-  port_free "$PORT" || die "port $PORT is busy"
+  WT_PORT="${1:-$(pick_port)}"
+  # An explicit or pinned port must be a real one. A word here (a mistyped
+  # flag, say) reached lsof as a service name, lsof failed, that failure read
+  # as "port free", and a server started with the word as its {port}.
+  case "$WT_PORT" in ''|*[!0-9]*) die "not a port number: $WT_PORT" ;; esac
+  { [ "$WT_PORT" -ge 1 ] && [ "$WT_PORT" -le 65535 ]; } || die "port out of range: $WT_PORT"
+  port_free "$WT_PORT" || die "port $WT_PORT is busy"
   [ "$LEVEL" = own_db ] && ensure_own_db
   cmd="${PREPARE:+$(expand "$PREPARE") && }${BUILD:+$(expand "$BUILD") && }$(expand "$SERVER_CMD")"
   if [ "$RUNNER" = compose ]; then
@@ -755,9 +795,9 @@ cmd_server() {
     fi
     cd "$PRIMARY"
     docker compose run -d --rm --no-deps --name "$name" \
-      -l "wt.project=$PROJECT" -l "wt.slug=$SLUG" -l "wt.port=$PORT" -l "wt.isolation=$LEVEL" \
-      -p "$PORT:$CONTAINER_PORT" $(compose_args "$LEVEL") "$SERVICE" sh -c "$cmd" >/dev/null
-    note "$SLUG [$LEVEL] -> http://localhost:$PORT  (logs: wt logs $SLUG)"
+      -l "wt.project=$PROJECT" -l "wt.slug=$SLUG" -l "wt.port=$WT_PORT" -l "wt.isolation=$LEVEL" \
+      -p "$WT_PORT:$CONTAINER_PORT" $(compose_args "$LEVEL") "$SERVICE" sh -c "$cmd" >/dev/null
+    note "$SLUG [$LEVEL] -> http://localhost:$WT_PORT  (logs: wt logs $SLUG)"
   else
     pidfile="$STATE_DIR/$SLUG.pid"
     if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
@@ -779,8 +819,8 @@ cmd_server() {
       fi
       echo $! > "$pidfile"
     )
-    echo "$PORT" > "$STATE_DIR/$SLUG.port"
-    note "$SLUG [$LEVEL] -> http://localhost:$PORT  (pid $(cat "$pidfile"), logs: wt logs $SLUG)"
+    echo "$WT_PORT" > "$STATE_DIR/$SLUG.port"
+    note "$SLUG [$LEVEL] -> http://localhost:$WT_PORT  (pid $(cat "$pidfile"), logs: wt logs $SLUG)"
   fi
 }
 
@@ -1039,6 +1079,12 @@ cmd_new() {
   if [ -n "$_existing" ]; then
     die "branch $_branch already has a worktree at $_existing — use: wt switch $_branch"
   fi
+  # An existing branch is adopted as it is: `git worktree add <path> <branch>`
+  # takes no start point, so a --from given alongside was silently dropped —
+  # the user asked for a branch off <base> and got the old branch instead.
+  if [ -n "$_base" ] && git show-ref --verify --quiet "refs/heads/$_branch"; then
+    die "branch $_branch already exists — drop --from to adopt it as it is, or delete the branch first"
+  fi
 
   _path="$(expand_path "$(path_template)" "$_branch")"
   case "$_path" in
@@ -1145,7 +1191,12 @@ cmd_rm() {
       *)             _branch="$1"; shift ;;
     esac
   done
-  if [ -z "$_branch" ]; then _branch="$(git rev-parse --abbrev-ref HEAD)"; fi
+  if [ -z "$_branch" ]; then
+    _branch="$(git rev-parse --abbrev-ref HEAD)"
+    # a detached HEAD prints the literal "HEAD" — say so, rather than the
+    # true-but-useless "no worktree for branch HEAD"
+    [ "$_branch" != HEAD ] || die "detached HEAD — name the branch: wt rm <branch>"
+  fi
 
   _path="$(worktree_for_branch "$_branch")"
   if [ -z "$_path" ]; then die "no worktree for branch $_branch (see: wt list)"; fi
@@ -1215,7 +1266,10 @@ cmd_merge() {
       *)           _branch="$1"; shift ;;
     esac
   done
-  if [ -z "$_branch" ]; then _branch="$(git rev-parse --abbrev-ref HEAD)"; fi
+  if [ -z "$_branch" ]; then
+    _branch="$(git rev-parse --abbrev-ref HEAD)"
+    [ "$_branch" != HEAD ] || die "detached HEAD — name the branch: wt merge <branch>"
+  fi
 
   _path="$(worktree_for_branch "$_branch")"
   if [ -z "$_path" ]; then die "no worktree for branch $_branch (see: wt list)"; fi
@@ -1246,10 +1300,20 @@ cmd_merge() {
   if [ -n "$(git -C "$PRIMARY" status --porcelain)" ]; then
     die "the primary checkout at $PRIMARY is dirty — commit or stash first"
   fi
-  if git -C "$_path" rev-parse --verify --quiet "$_branch@{upstream}" >/dev/null 2>&1; then
-    if [ "$_force" = 0 ]; then
-      die "$_branch has an upstream — squashing rewrites published history; pass --force to proceed"
+  # Published = the branch itself exists on a remote, i.e. a remote-tracking
+  # ref carries its name. NOT "has an upstream": `wt new x --from origin/main`
+  # makes git set x's upstream to origin/main, and refusing on that made the
+  # README's own example unmergeable without --force.
+  # Check each remote explicitly: a for-each-ref glob `refs/remotes/*/$branch`
+  # would match `origin/foo/bar` when $_branch is just `bar`.
+  _pub=""
+  for _r in $(git -C "$_path" remote); do
+    if git -C "$_path" rev-parse --verify --quiet "refs/remotes/$_r/$_branch" >/dev/null 2>&1; then
+      _pub="$_r/$_branch"; break
     fi
+  done
+  if [ -n "$_pub" ] && [ "$_force" = 0 ]; then
+    die "$_branch is published as $_pub — squashing rewrites published history; pass --force to proceed"
   fi
 
   # ---- backup ref: the undo for everything below ----
