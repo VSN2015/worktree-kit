@@ -362,7 +362,8 @@ worktree_rows() {
                   --format '{{.Label "wt.port"}}' 2>/dev/null | head -1)"
         _iso="$(docker ps --filter "label=wt.project=$PROJECT" --filter "label=wt.slug=$_s" \
                   --format '{{.Label "wt.isolation"}}' 2>/dev/null | head -1)"
-      elif [ -f "$STATE_DIR/$_s.pid" ]; then
+      # a pidfile outlives a crashed server — show only a live one, as wt ps does
+      elif [ -f "$STATE_DIR/$_s.pid" ] && kill -0 "$(cat "$STATE_DIR/$_s.pid")" 2>/dev/null; then
         _srv="$(cat "$STATE_DIR/$_s.port" 2>/dev/null || echo '?')"
       fi
     fi
@@ -672,12 +673,18 @@ exclude_link() { # <worktree-path> <path>
   note "link: $2 — added /$2 to .git/info/exclude (the ignore rule matched dirs only)"
 }
 
+# `links:` entries with trailing slashes stripped. ".claude/" is the natural
+# spelling (it is how the gitignore rule reads), but ln -s refuses a
+# destination ending in /, and test -L sees through one — so the link was
+# never created, and wt doctor flagged it as missing forever.
+link_paths() { cfg_list links | sed 's|/*$||'; }
+
 # Symlinks every `links:` path from the primary into the worktree at $1. The
 # target is absolute so the link resolves from any cwd. Nothing already at
 # the destination is removed or replaced; failures are noted and skipped so
 # one bad path never blocks the rest, or the wt new that called this.
 apply_links() { # <worktree-path>
-  for _lp in $(cfg_list links); do
+  for _lp in $(link_paths); do
     [ -n "$_lp" ] || continue
     _src="$PRIMARY/$_lp"; _dst="$1/$_lp"
     if [ ! -e "$_src" ]; then
@@ -753,8 +760,11 @@ cmd_run() {
   if [ "$RUNNER" = compose ]; then
     cd "$PRIMARY"
     T=""; [ -t 1 ] || T="-T"
+    # &&, not ;: a failed prepare must stop the payload, as on the host
+    # runner below — with ; the payload ran anyway and its exit status hid
+    # the failure, so wt new never saw "prepare hook failed" for compose.
     exec docker compose run --rm --no-deps $T $(compose_args "$LEVEL") "$SERVICE" \
-      sh -c "$(prepare_cmd); exec \"\$@\"" sh "$@"
+      sh -c "$(prepare_cmd) && exec \"\$@\"" sh "$@"
   else
     envs="$(iso_env_list "$LEVEL" | tr '\n' ' ')"
     cd "$WT_PATH"
@@ -1030,7 +1040,7 @@ cmd_doctor() {
   fi
 
   if [ "$WT_PATH" != "$PRIMARY" ] && [ "$HAS_CONFIG" = 1 ]; then
-    for _lp in $(cfg_list links); do
+    for _lp in $(link_paths); do
       if [ ! -L "$WT_PATH/$_lp" ] || [ "$(readlink "$WT_PATH/$_lp")" != "$PRIMARY/$_lp" ]; then
         echo "MISSING link: $_lp (wt link)"
       fi

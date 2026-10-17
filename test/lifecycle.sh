@@ -1191,5 +1191,101 @@ else
   ok "run: {port} is empty under wt run even when the caller exports PORT (skipped: no YAML backend)"
 fi
 
+# ---------- a failing prepare hook under the compose runner ----------
+#
+# The compose path of wt run chained the hook with `;` — `sh -c "prepare;
+# exec cmd"` — so a failed prepare (bundle install, npm ci) still ran the
+# payload and exited with ITS status. The host runner always stopped, and
+# wt new's "prepare hook failed" refusal never fired for compose repos.
+# A stub docker runs the `docker compose run` payload on the host, so this
+# needs no daemon.
+FAKEDOCKER_BIN="$TMP/fakedocker-bin"
+mkdir -p "$FAKEDOCKER_BIN"
+cat > "$FAKEDOCKER_BIN/docker" <<'EOF'
+#!/bin/sh
+case "${1:-}" in compose) shift ;; *) exit 0 ;; esac
+[ "${1:-}" = run ] || exit 0; shift
+while [ $# -gt 0 ]; do case "$1" in
+  --rm|--no-deps|-T|-d) shift ;;
+  -v|-l|-p|--name) shift 2 ;;
+  -e) export "$2"; shift 2 ;;
+  *) break ;;
+esac; done
+shift   # the service name
+exec "$@"
+EOF
+chmod +x "$FAKEDOCKER_BIN/docker"
+
+new_repo composeprepfail
+if have_yaml; then
+  payload="$TMP/compose-payload-ran"
+  cat > worktree-kit.yml <<'YML'
+runner: compose
+hooks:
+  prepare: "echo prepare failed >&2; false"
+YML
+  if PATH="$FAKEDOCKER_BIN:$PATH" "$WT" run -- touch "$payload" >/dev/null 2>&1; then
+    fail "run: a failing prepare makes compose wt run exit nonzero"
+  else
+    ok "run: a failing prepare makes compose wt run exit nonzero"
+  fi
+  assert_eq "1" "$(test -e "$payload" && echo 0 || echo 1)" \
+    "run: a failing prepare stops the compose payload, like the host runner"
+  err="$(PATH="$FAKEDOCKER_BIN:$PATH" "$WT" new feat/prepfail 2>&1 >/dev/null || true)"
+  assert_contains "$err" "prepare hook failed" \
+    "new: a failing prepare is reported under the compose runner too"
+else
+  ok "run: compose prepare-failure tests skipped (no YAML backend installed)"
+fi
+
+# ---------- wt list: a host server whose process has died ----------
+#
+# The SERVER column for the host runner keyed off the pidfile alone, so a
+# server that crashed (or exited at once) still showed its port in wt list
+# while wt ps, one command over, reported it dead.
+new_repo deadsrvrepo
+if have_yaml; then
+  printf 'runner: host\nhooks:\n  server: "sleep 30"\n' > worktree-kit.yml
+  wt_ok server
+  live_port="$(cat .git/wt-state/deadsrvrepo.port 2>/dev/null || echo none)"
+  out="$("$WT" list)" || fail "setup: wt list with a live server"
+  assert_contains "$out" ":$live_port" "list: a live host server shows its port"
+  wt_ok down
+
+  printf 'runner: host\nhooks:\n  server: "true"\n' > worktree-kit.yml
+  wt_ok server
+  dead_port="$(cat .git/wt-state/deadsrvrepo.port 2>/dev/null || echo none)"
+  dead_pid="$(cat .git/wt-state/deadsrvrepo.pid 2>/dev/null || echo 0)"
+  _i=0
+  while kill -0 "$dead_pid" 2>/dev/null && [ "$_i" -lt 10 ]; do sleep 1; _i=$((_i + 1)); done
+  out="$("$WT" list)" || fail "setup: wt list with a dead server"
+  assert_missing "$out" ":$dead_port" "list: a dead host server is not shown as running"
+else
+  ok "list: host server column tests skipped (no YAML backend installed)"
+fi
+
+# ---------- links: entries written with a trailing slash ----------
+#
+# ".claude/" is how the gitignore rule reads, and how the README names the
+# folder — but ln -s refuses a destination ending in /, so the link was never
+# created; wt link could not repair it and wt doctor flagged it forever.
+new_repo slashlinkrepo
+if have_yaml; then
+  mkdir .claude && echo skill > .claude/one.md
+  printf '.claude/\n' > .gitignore
+  printf 'runner: host\nhooks:\n  server: "true"\nlinks: [.claude/]\n' > worktree-kit.yml
+  git add .gitignore worktree-kit.yml && git commit -qm 'slash link config'
+  wt_ok new feat/slash
+  wts="$TMP/slashlinkrepo-worktrees/feat_slash"
+  assert_eq "$REPO/.claude" "$(readlink "$wts/.claude" || true)" \
+    "link: a trailing-slash links: entry still creates the symlink"
+  assert_eq "!! .claude" "$(git -C "$wts" status --short --ignored .claude)" \
+    "link: the trailing-slash link is ignored, not untracked"
+  out="$( (cd "$wts" && "$WT" doctor 2>&1) )" || fail "setup: wt doctor with a trailing-slash link"
+  assert_missing "$out" "MISSING link" "doctor: a trailing-slash links: entry is satisfied by the link"
+else
+  ok "link: trailing-slash tests skipped (no YAML backend installed)"
+fi
+
 [ "$FAILED" = 0 ] || { echo "LIFECYCLE FAIL" >&2; exit 1; }
 echo "LIFECYCLE PASS"
